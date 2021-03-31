@@ -18,6 +18,7 @@ package cmd
 
 import (
 	"context"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -254,25 +255,18 @@ func ToMinioClientCompleteParts(parts []CompletePart) []minio.CompletePart {
 // IsBackendOnline - verifies if the backend is reachable
 // by performing a GET request on the URL. returns 'true'
 // if backend is reachable.
-func IsBackendOnline(ctx context.Context, clnt *http.Client, urlStr string) bool {
+func IsBackendOnline(ctx context.Context, host string) bool {
+	var d net.Dialer
+
 	ctx, cancel := context.WithTimeout(ctx, 1*time.Second)
 	defer cancel()
 
-	// never follow redirects
-	clnt.CheckRedirect = func(*http.Request, []*http.Request) error {
-		return http.ErrUseLastResponse
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlStr, nil)
+	conn, err := d.DialContext(ctx, "tcp", host)
 	if err != nil {
 		return false
 	}
-	resp, err := clnt.Do(req)
-	if err != nil {
-		clnt.CloseIdleConnections()
-		return !xnet.IsNetworkOrHostDown(err)
-	}
-	xhttp.DrainBody(resp.Body)
+
+	conn.Close()
 	return true
 }
 
@@ -291,7 +285,7 @@ func ErrorRespToObjectError(err error, params ...string) error {
 		object = params[1]
 	}
 
-	if xnet.IsNetworkOrHostDown(err) {
+	if xnet.IsNetworkOrHostDown(err, false) {
 		return BackendDown{}
 	}
 
@@ -395,7 +389,7 @@ func shouldMeterRequest(req *http.Request) bool {
 // MetricsTransport is a custom wrapper around Transport to track metrics
 type MetricsTransport struct {
 	Transport *http.Transport
-	Metrics   *Metrics
+	Metrics   *BackendMetrics
 }
 
 // RoundTrip implements the RoundTrip method for MetricsTransport

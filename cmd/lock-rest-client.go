@@ -19,10 +19,9 @@ package cmd
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
-	"errors"
 	"io"
 	"net/url"
+	"strconv"
 
 	"github.com/minio/minio/cmd/http"
 	xhttp "github.com/minio/minio/cmd/http"
@@ -33,7 +32,7 @@ import (
 // lockRESTClient is authenticable lock REST client
 type lockRESTClient struct {
 	restClient *rest.Client
-	endpoint   Endpoint
+	u          *url.URL
 }
 
 func toLockError(err error) error {
@@ -44,15 +43,15 @@ func toLockError(err error) error {
 	switch err.Error() {
 	case errLockConflict.Error():
 		return errLockConflict
-	case errLockNotExpired.Error():
-		return errLockNotExpired
+	case errLockNotFound.Error():
+		return errLockNotFound
 	}
 	return err
 }
 
 // String stringer *dsync.NetLocker* interface compatible method.
 func (client *lockRESTClient) String() string {
-	return client.endpoint.String()
+	return client.u.String()
 }
 
 // Wrapper to restClient.Call to handle network errors, in case of network error the connection is marked disconnected
@@ -76,6 +75,11 @@ func (client *lockRESTClient) IsOnline() bool {
 	return client.restClient.IsOnline()
 }
 
+// Not a local locker
+func (client *lockRESTClient) IsLocal() bool {
+	return false
+}
+
 // Close - marks the client as closed.
 func (client *lockRESTClient) Close() error {
 	client.restClient.Close()
@@ -88,6 +92,7 @@ func (client *lockRESTClient) restCall(ctx context.Context, call string, args ds
 	values.Set(lockRESTUID, args.UID)
 	values.Set(lockRESTOwner, args.Owner)
 	values.Set(lockRESTSource, args.Source)
+	values.Set(lockRESTQuorum, strconv.Itoa(args.Quorum))
 	var buffer bytes.Buffer
 	for _, resource := range args.Resources {
 		buffer.WriteString(resource)
@@ -98,7 +103,7 @@ func (client *lockRESTClient) restCall(ctx context.Context, call string, args ds
 	switch err {
 	case nil:
 		return true, nil
-	case errLockConflict, errLockNotExpired:
+	case errLockConflict, errLockNotFound:
 		return false, nil
 	default:
 		return false, err
@@ -120,19 +125,24 @@ func (client *lockRESTClient) RUnlock(args dsync.LockArgs) (reply bool, err erro
 	return client.restCall(context.Background(), lockRESTMethodRUnlock, args)
 }
 
+// RUnlock calls read unlock REST API.
+func (client *lockRESTClient) Refresh(ctx context.Context, args dsync.LockArgs) (reply bool, err error) {
+	return client.restCall(ctx, lockRESTMethodRefresh, args)
+}
+
 // Unlock calls write unlock RPC.
 func (client *lockRESTClient) Unlock(args dsync.LockArgs) (reply bool, err error) {
 	return client.restCall(context.Background(), lockRESTMethodUnlock, args)
 }
 
-// Expired calls expired handler to check if lock args have expired.
-func (client *lockRESTClient) Expired(ctx context.Context, args dsync.LockArgs) (expired bool, err error) {
-	return client.restCall(ctx, lockRESTMethodExpired, args)
+// ForceUnlock calls force unlock handler to forcibly unlock an active lock.
+func (client *lockRESTClient) ForceUnlock(ctx context.Context, args dsync.LockArgs) (reply bool, err error) {
+	return client.restCall(ctx, lockRESTMethodForceUnlock, args)
 }
 
 func newLockAPI(endpoint Endpoint) dsync.NetLocker {
 	if endpoint.IsLocal {
-		return globalLockServers[endpoint]
+		return globalLockServer
 	}
 	return newlockRESTClient(endpoint)
 }
@@ -142,29 +152,24 @@ func newlockRESTClient(endpoint Endpoint) *lockRESTClient {
 	serverURL := &url.URL{
 		Scheme: endpoint.Scheme,
 		Host:   endpoint.Host,
-		Path:   pathJoin(lockRESTPrefix, endpoint.Path, lockRESTVersion),
+		Path:   pathJoin(lockRESTPrefix, lockRESTVersion),
 	}
 
-	var tlsConfig *tls.Config
-	if globalIsSSL {
-		tlsConfig = &tls.Config{
-			ServerName: endpoint.Hostname(),
-			RootCAs:    globalRootCAs,
-		}
-	}
-
-	trFn := newInternodeHTTPTransport(tlsConfig, rest.DefaultTimeout)
-	restClient := rest.NewClient(serverURL, trFn, newAuthToken)
+	restClient := rest.NewClient(serverURL, globalInternodeTransport, newAuthToken)
+	restClient.ExpectTimeouts = true
+	// Use a separate client to avoid recursive calls.
+	healthClient := rest.NewClient(serverURL, globalInternodeTransport, newAuthToken)
+	healthClient.ExpectTimeouts = true
 	restClient.HealthCheckFn = func() bool {
-		ctx, cancel := context.WithTimeout(GlobalContext, restClient.HealthCheckTimeout)
-		// Instantiate a new rest client for healthcheck
-		// to avoid recursive healthCheckFn()
-		respBody, err := rest.NewClient(serverURL, trFn, newAuthToken).Call(ctx, lockRESTMethodHealth, nil, nil, -1)
+		ctx, cancel := context.WithTimeout(context.Background(), restClient.HealthCheckTimeout)
+		defer cancel()
+		respBody, err := healthClient.Call(ctx, lockRESTMethodHealth, nil, nil, -1)
 		xhttp.DrainBody(respBody)
-		cancel()
-		var ne *rest.NetworkError
-		return !errors.Is(err, context.DeadlineExceeded) && !errors.As(err, &ne)
+		return !isNetworkError(err)
 	}
 
-	return &lockRESTClient{endpoint: endpoint, restClient: restClient}
+	return &lockRESTClient{u: &url.URL{
+		Scheme: endpoint.Scheme,
+		Host:   endpoint.Host,
+	}, restClient: restClient}
 }

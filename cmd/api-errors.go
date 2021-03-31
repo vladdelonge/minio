@@ -87,6 +87,7 @@ const (
 	ErrInvalidMaxUploads
 	ErrInvalidMaxParts
 	ErrInvalidPartNumberMarker
+	ErrInvalidPartNumber
 	ErrInvalidRequestBody
 	ErrInvalidCopySource
 	ErrInvalidMetadataDirective
@@ -106,22 +107,24 @@ const (
 	ErrNoSuchCORSConfiguration
 	ErrNoSuchWebsiteConfiguration
 	ErrReplicationConfigurationNotFoundError
-	ErrReplicationDestinationNotFoundError
+	ErrRemoteDestinationNotFoundError
 	ErrReplicationDestinationMissingLock
-	ErrReplicationTargetNotFoundError
+	ErrRemoteTargetNotFoundError
 	ErrReplicationRemoteConnectionError
 	ErrBucketRemoteIdenticalToSource
 	ErrBucketRemoteAlreadyExists
+	ErrBucketRemoteLabelInUse
 	ErrBucketRemoteArnTypeInvalid
 	ErrBucketRemoteArnInvalid
 	ErrBucketRemoteRemoveDisallowed
-	ErrReplicationTargetNotVersionedError
+	ErrRemoteTargetNotVersionedError
 	ErrReplicationSourceNotVersionedError
 	ErrReplicationNeedsVersioningError
 	ErrReplicationBucketNeedsVersioningError
-	ErrBucketReplicationDisabledError
+	ErrObjectRestoreAlreadyInProgress
 	ErrNoSuchKey
 	ErrNoSuchUpload
+	ErrInvalidVersionID
 	ErrNoSuchVersion
 	ErrNotImplemented
 	ErrPreconditionFailed
@@ -232,6 +235,7 @@ const (
 	ErrInvalidResourceName
 	ErrServerNotInitialized
 	ErrOperationTimedOut
+	ErrClientDisconnected
 	ErrOperationMaxedOut
 	ErrInvalidRequest
 	// MinIO storage class error codes
@@ -259,7 +263,6 @@ const (
 	// Bucket Quota error codes
 	ErrAdminBucketQuotaExceeded
 	ErrAdminNoSuchQuotaConfiguration
-	ErrAdminBucketQuotaDisabled
 
 	ErrHealNotImplemented
 	ErrHealNoSuchProcess
@@ -360,6 +363,7 @@ const (
 	ErrInvalidDecompressedSize
 	ErrAddUserInvalidArgument
 	ErrAdminAccountNotEligible
+	ErrAccountNotEligible
 	ErrServiceAccountNotFound
 	ErrPostPolicyConditionInvalidFormat
 )
@@ -433,6 +437,11 @@ var errorCodes = errorCodeMap{
 		Code:           "InvalidArgument",
 		Description:    "Argument partNumberMarker must be an integer.",
 		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrInvalidPartNumber: {
+		Code:           "InvalidPartNumber",
+		Description:    "The requested partnumber is not satisfiable",
+		HTTPStatusCode: http.StatusRequestedRangeNotSatisfiable,
 	},
 	ErrInvalidPolicyDocument: {
 		Code:           "InvalidPolicyDocument",
@@ -554,10 +563,15 @@ var errorCodes = errorCodeMap{
 		Description:    "The specified multipart upload does not exist. The upload ID may be invalid, or the upload may have been aborted or completed.",
 		HTTPStatusCode: http.StatusNotFound,
 	},
-	ErrNoSuchVersion: {
+	ErrInvalidVersionID: {
 		Code:           "InvalidArgument",
 		Description:    "Invalid version id specified",
 		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrNoSuchVersion: {
+		Code:           "NoSuchVersion",
+		Description:    "The specified version does not exist.",
+		HTTPStatusCode: http.StatusNotFound,
 	},
 	ErrNotImplemented: {
 		Code:           "NotImplemented",
@@ -809,9 +823,9 @@ var errorCodes = errorCodeMap{
 		Description:    "The replication configuration was not found",
 		HTTPStatusCode: http.StatusNotFound,
 	},
-	ErrReplicationDestinationNotFoundError: {
-		Code:           "ReplicationDestinationNotFoundError",
-		Description:    "The replication destination bucket does not exist",
+	ErrRemoteDestinationNotFoundError: {
+		Code:           "RemoteDestinationNotFoundError",
+		Description:    "The remote destination bucket does not exist",
 		HTTPStatusCode: http.StatusNotFound,
 	},
 	ErrReplicationDestinationMissingLock: {
@@ -819,29 +833,34 @@ var errorCodes = errorCodeMap{
 		Description:    "The replication destination bucket does not have object locking enabled",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
-	ErrReplicationTargetNotFoundError: {
-		Code:           "XminioAdminReplicationTargetNotFoundError",
-		Description:    "The replication target does not exist",
+	ErrRemoteTargetNotFoundError: {
+		Code:           "XMinioAdminRemoteTargetNotFoundError",
+		Description:    "The remote target does not exist",
 		HTTPStatusCode: http.StatusNotFound,
 	},
 	ErrReplicationRemoteConnectionError: {
-		Code:           "XminioAdminReplicationRemoteConnectionError",
-		Description:    "Remote service endpoint or target bucket not available",
+		Code:           "XMinioAdminReplicationRemoteConnectionError",
+		Description:    "Remote service connection error - please check remote service credentials and target bucket",
 		HTTPStatusCode: http.StatusNotFound,
 	},
 	ErrBucketRemoteIdenticalToSource: {
-		Code:           "XminioAdminRemoteIdenticalToSource",
+		Code:           "XMinioAdminRemoteIdenticalToSource",
 		Description:    "The remote target cannot be identical to source",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
 	ErrBucketRemoteAlreadyExists: {
-		Code:           "XminioAdminBucketRemoteAlreadyExists",
+		Code:           "XMinioAdminBucketRemoteAlreadyExists",
 		Description:    "The remote target already exists",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrBucketRemoteLabelInUse: {
+		Code:           "XMinioAdminBucketRemoteLabelInUse",
+		Description:    "The remote target with this label already exists",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
 	ErrBucketRemoteRemoveDisallowed: {
 		Code:           "XMinioAdminRemoteRemoveDisallowed",
-		Description:    "Replication configuration exists with this ARN.",
+		Description:    "This ARN is in use by an existing configuration",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
 	ErrBucketRemoteArnTypeInvalid: {
@@ -854,9 +873,9 @@ var errorCodes = errorCodeMap{
 		Description:    "The bucket remote ARN does not have correct format",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
-	ErrReplicationTargetNotVersionedError: {
-		Code:           "ReplicationTargetNotVersionedError",
-		Description:    "The replication target does not have versioning enabled",
+	ErrRemoteTargetNotVersionedError: {
+		Code:           "RemoteTargetNotVersionedError",
+		Description:    "The remote target does not have versioning enabled",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
 	ErrReplicationSourceNotVersionedError: {
@@ -872,11 +891,6 @@ var errorCodes = errorCodeMap{
 	ErrReplicationBucketNeedsVersioningError: {
 		Code:           "InvalidRequest",
 		Description:    "Versioning must be 'Enabled' on the bucket to add a replication target",
-		HTTPStatusCode: http.StatusBadRequest,
-	},
-	ErrBucketReplicationDisabledError: {
-		Code:           "XMinioAdminBucketReplicationDisabled",
-		Description:    "Replication specified but disk usage crawl is disabled on MinIO server",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
 	ErrNoSuchObjectLockConfiguration: {
@@ -908,6 +922,11 @@ var errorCodes = errorCodeMap{
 		Code:           "InvalidRequest",
 		Description:    "x-amz-object-lock-retain-until-date and x-amz-object-lock-mode must both be supplied",
 		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrObjectRestoreAlreadyInProgress: {
+		Code:           "RestoreAlreadyInProgress",
+		Description:    "Object restore is already in progress",
+		HTTPStatusCode: http.StatusConflict,
 	},
 	/// Bucket notification related errors.
 	ErrEventNotification: {
@@ -1195,11 +1214,6 @@ var errorCodes = errorCodeMap{
 		Description:    "The quota configuration does not exist",
 		HTTPStatusCode: http.StatusNotFound,
 	},
-	ErrAdminBucketQuotaDisabled: {
-		Code:           "XMinioAdminBucketQuotaDisabled",
-		Description:    "Quota specified but disk usage crawl is disabled on MinIO server",
-		HTTPStatusCode: http.StatusBadRequest,
-	},
 	ErrInsecureClientRequest: {
 		Code:           "XMinioInsecureClientRequest",
 		Description:    "Cannot respond to plain-text request from TLS-encrypted server",
@@ -1209,6 +1223,11 @@ var errorCodes = errorCodeMap{
 		Code:           "RequestTimeout",
 		Description:    "A timeout occurred while trying to lock a resource, please reduce your request rate",
 		HTTPStatusCode: http.StatusServiceUnavailable,
+	},
+	ErrClientDisconnected: {
+		Code:           "ClientDisconnected",
+		Description:    "Client disconnected before response was ready",
+		HTTPStatusCode: 499, // No official code, use nginx value.
 	},
 	ErrOperationMaxedOut: {
 		Code:           "SlowDown",
@@ -1708,12 +1727,17 @@ var errorCodes = errorCodeMap{
 	ErrAddUserInvalidArgument: {
 		Code:           "XMinioInvalidIAMCredentials",
 		Description:    "User is not allowed to be same as admin access key",
-		HTTPStatusCode: http.StatusConflict,
+		HTTPStatusCode: http.StatusForbidden,
 	},
 	ErrAdminAccountNotEligible: {
 		Code:           "XMinioInvalidIAMCredentials",
 		Description:    "The administrator key is not eligible for this operation",
-		HTTPStatusCode: http.StatusConflict,
+		HTTPStatusCode: http.StatusForbidden,
+	},
+	ErrAccountNotEligible: {
+		Code:           "XMinioInvalidIAMCredentials",
+		Description:    "The account key is not eligible for this operation",
+		HTTPStatusCode: http.StatusForbidden,
 	},
 	ErrServiceAccountNotFound: {
 		Code:           "XMinioInvalidIAMCredentials",
@@ -1734,6 +1758,16 @@ var errorCodes = errorCodeMap{
 func toAPIErrorCode(ctx context.Context, err error) (apiErr APIErrorCode) {
 	if err == nil {
 		return ErrNone
+	}
+
+	// Only return ErrClientDisconnected if the provided context is actually canceled.
+	// This way downstream context.Canceled will still report ErrOperationTimedOut
+	select {
+	case <-ctx.Done():
+		if ctx.Err() == context.Canceled {
+			return ErrClientDisconnected
+		}
+	default:
 	}
 
 	switch err {
@@ -1852,6 +1886,8 @@ func toAPIErrorCode(ctx context.Context, err error) (apiErr APIErrorCode) {
 		apiErr = ErrNoSuchKey
 	case MethodNotAllowed:
 		apiErr = ErrMethodNotAllowed
+	case InvalidVersionID:
+		apiErr = ErrInvalidVersionID
 	case VersionNotFound:
 		apiErr = ErrNoSuchVersion
 	case ObjectAlreadyExists:
@@ -1906,24 +1942,26 @@ func toAPIErrorCode(ctx context.Context, err error) (apiErr APIErrorCode) {
 		apiErr = ErrAdminNoSuchQuotaConfiguration
 	case BucketReplicationConfigNotFound:
 		apiErr = ErrReplicationConfigurationNotFoundError
-	case BucketReplicationDestinationNotFound:
-		apiErr = ErrReplicationDestinationNotFoundError
+	case BucketRemoteDestinationNotFound:
+		apiErr = ErrRemoteDestinationNotFoundError
 	case BucketReplicationDestinationMissingLock:
 		apiErr = ErrReplicationDestinationMissingLock
 	case BucketRemoteTargetNotFound:
-		apiErr = ErrReplicationTargetNotFoundError
+		apiErr = ErrRemoteTargetNotFoundError
 	case BucketRemoteConnectionErr:
 		apiErr = ErrReplicationRemoteConnectionError
 	case BucketRemoteAlreadyExists:
 		apiErr = ErrBucketRemoteAlreadyExists
+	case BucketRemoteLabelInUse:
+		apiErr = ErrBucketRemoteLabelInUse
 	case BucketRemoteArnTypeInvalid:
 		apiErr = ErrBucketRemoteArnTypeInvalid
 	case BucketRemoteArnInvalid:
 		apiErr = ErrBucketRemoteArnInvalid
 	case BucketRemoteRemoveDisallowed:
 		apiErr = ErrBucketRemoteRemoveDisallowed
-	case BucketReplicationTargetNotVersioned:
-		apiErr = ErrReplicationTargetNotVersionedError
+	case BucketRemoteTargetNotVersioned:
+		apiErr = ErrRemoteTargetNotVersionedError
 	case BucketReplicationSourceNotVersioned:
 		apiErr = ErrReplicationSourceNotVersionedError
 	case BucketQuotaExceeded:
@@ -1956,6 +1994,8 @@ func toAPIErrorCode(ctx context.Context, err error) (apiErr APIErrorCode) {
 		apiErr = ErrBackendDown
 	case ObjectNameTooLong:
 		apiErr = ErrKeyTooLongError
+	case dns.ErrInvalidBucketName:
+		apiErr = ErrInvalidBucketName
 	default:
 		var ie, iw int
 		// This work-around is to handle the issue golang/go#30648
@@ -1992,6 +2032,12 @@ func toAPIError(ctx context.Context, err error) APIError {
 	}
 
 	var apiErr = errorCodes.ToAPIErr(toAPIErrorCode(ctx, err))
+	e, ok := err.(dns.ErrInvalidBucketName)
+	if ok {
+		code := toAPIErrorCode(ctx, e)
+		apiErr = errorCodes.ToAPIErrWithErr(code, e)
+	}
+
 	if apiErr.Code == "InternalError" {
 		// If we see an internal error try to interpret
 		// any underlying errors if possible depending on
@@ -2079,6 +2125,12 @@ func toAPIError(ctx context.Context, err error) APIError {
 				HTTPStatusCode: e.Response().StatusCode,
 			}
 			// Add more Gateway SDKs here if any in future.
+		default:
+			apiErr = APIError{
+				Code:           apiErr.Code,
+				Description:    fmt.Sprintf("%s: cause(%v)", apiErr.Description, err),
+				HTTPStatusCode: apiErr.HTTPStatusCode,
+			}
 		}
 	}
 

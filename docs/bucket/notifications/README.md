@@ -1,12 +1,37 @@
 # MinIO Bucket Notification Guide [![Slack](https://slack.min.io/slack?type=svg)](https://slack.min.io)
 
-Events occurring on objects in a bucket can be monitored using bucket event notifications. Event types supported by MinIO server are
+Events occurring on objects in a bucket can be monitored using bucket event notifications.
 
-| Supported Event Types   |                                            |                          |
-| :---------------------- | ------------------------------------------ | ------------------------ |
-| `s3:ObjectCreated:Put`  | `s3:ObjectCreated:CompleteMultipartUpload` | `s3:ObjectAccessed:Head` |
-| `s3:ObjectCreated:Post` | `s3:ObjectRemoved:Delete`                  |                          |
-| `s3:ObjectCreated:Copy` | `s3:ObjectAccessed:Get`                    |                          |
+> NOTE: Gateway mode does not support bucket notifications (except NAS gateway).
+
+Various event types supported by MinIO server are
+
+| Supported Object Event Types     |                                            |                                        |
+| :----------------------          | ------------------------------------------ | -------------------------------------  |
+| `s3:ObjectCreated:Put`           | `s3:ObjectCreated:CompleteMultipartUpload` | `s3:ObjectAccessed:Head`               |
+| `s3:ObjectCreated:Post`          | `s3:ObjectRemoved:Delete`                  | `s3:ObjectRemoved:DeleteMarkerCreated` |
+| `s3:ObjectCreated:Copy`          | `s3:ObjectAccessed:Get`                    |                                        |
+| `s3:ObjectCreated:PutRetention`  | `s3:ObjectCreated:PutLegalHold`            |                                        |
+| `s3:ObjectAccessed:GetRetention` | `s3:ObjectAccessed:GetLegalHold`           |                                        |
+
+| Supported Replication Event Types                  |
+| :------------                                      |
+| `s3:Replication:OperationFailedReplication`        |
+| `s3:Replication:OperationCompletedReplication`     |
+| `s3:Replication:OperationNotTracked`               |
+| `s3:Replication:OperationMissedThreshold`          |
+| `s3:Replication:OperationReplicatedAfterThreshold` |
+
+| Supported ILM Transition Event Types |
+| :-----                               |
+| `s3:ObjectRestore:Post`              |
+| `s3:ObjectRestore:Completed`         |
+
+| Supported Global Event Types (Only supported through ListenNotification API) |
+| :-----                                                                       |
+| `s3:BucketCreated`                                                           |
+| `s3:BucketRemoved`                                                           |
+
 
 Use client tools like `mc` to set and listen for event notifications using the [`event` sub-command](https://docs.min.io/docs/minio-client-complete-guide#events). MinIO SDK's [`BucketNotification` APIs](https://docs.min.io/docs/golang-client-api-reference#SetBucketNotification) can also be used. The notification message MinIO sends to publish an event is a JSON message with the following [structure](https://docs.aws.amazon.com/AmazonS3/latest/dev/notification-content-structure.html).
 
@@ -882,7 +907,7 @@ MINIO_NOTIFY_POSTGRES_MAX_OPEN_CONNECTIONS (number)             maximum number o
 ```
 
 > NOTE: If the `max_open_connections` key or the environment variable `MINIO_NOTIFY_POSTGRES_MAX_OPEN_CONNECTIONS` is set to `0`, There will be no limit set on the number of
-> open connections to the database. This setting is generally NOT recommended as the behaviour may be inconsistent during recursive deletes in `namespace` format.
+> open connections to the database. This setting is generally NOT recommended as the behavior may be inconsistent during recursive deletes in `namespace` format.
 
 MinIO supports persistent event store. The persistent store will backup events when the PostgreSQL connection goes offline and replays it when the broker comes back online. The event store can be configured by setting the directory path in `queue_dir` field and the maximum limit of events in the queue_dir in `queue_limit` field. For eg, the `queue_dir` can be `/home/events` and `queue_limit` can be `1000`. By default, the `queue_limit` is set to 100000.
 
@@ -1016,7 +1041,7 @@ MINIO_NOTIFY_MYSQL_COMMENT              (sentence)           optionally add a co
 ```
 
 > NOTE: If the `max_open_connections` key or the environment variable `MINIO_NOTIFY_MYSQL_MAX_OPEN_CONNECTIONS` is set to `0`, There will be no limit set on the number of
-> open connections to the database. This setting is generally NOT recommended as the behaviour may be inconsistent during recursive deletes in `namespace` format.
+> open connections to the database. This setting is generally NOT recommended as the behavior may be inconsistent during recursive deletes in `namespace` format.
 
 `dsn_string` is required and is of form `"<user>:<password>@tcp(<host>:<port>)/<database>"`
 

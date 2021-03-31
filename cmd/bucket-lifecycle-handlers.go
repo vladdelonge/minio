@@ -38,7 +38,7 @@ const (
 func (api objectAPIHandlers) PutBucketLifecycleHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, w, "PutBucketLifecycle")
 
-	defer logger.AuditLog(w, r, "PutBucketLifecycle", mustGetClaimsFromToken(r))
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 
 	objAPI := api.ObjectAPI()
 	if objAPI == nil {
@@ -78,6 +78,12 @@ func (api objectAPIHandlers) PutBucketLifecycleHandler(w http.ResponseWriter, r 
 		return
 	}
 
+	// Validate the transition storage ARNs
+	if err = validateLifecycleTransition(ctx, bucket, bucketLifecycle); err != nil {
+		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL, guessIsBrowserReq(r))
+		return
+	}
+
 	configData, err := xml.Marshal(bucketLifecycle)
 	if err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL, guessIsBrowserReq(r))
@@ -97,7 +103,7 @@ func (api objectAPIHandlers) PutBucketLifecycleHandler(w http.ResponseWriter, r 
 func (api objectAPIHandlers) GetBucketLifecycleHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, w, "GetBucketLifecycle")
 
-	defer logger.AuditLog(w, r, "GetBucketLifecycle", mustGetClaimsFromToken(r))
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 
 	objAPI := api.ObjectAPI()
 	if objAPI == nil {
@@ -139,7 +145,7 @@ func (api objectAPIHandlers) GetBucketLifecycleHandler(w http.ResponseWriter, r 
 func (api objectAPIHandlers) DeleteBucketLifecycleHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, w, "DeleteBucketLifecycle")
 
-	defer logger.AuditLog(w, r, "DeleteBucketLifecycle", mustGetClaimsFromToken(r))
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 
 	objAPI := api.ObjectAPI()
 	if objAPI == nil {

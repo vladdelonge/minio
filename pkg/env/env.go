@@ -18,16 +18,26 @@
 package env
 
 import (
+	"strconv"
 	"strings"
 	"sync"
 )
 
 var (
 	privateMutex sync.RWMutex
+	lockEnvMutex sync.Mutex
 	envOff       bool
 )
 
+// LockSetEnv locks modifications to environment.
+// Call returned function to unlock.
+func LockSetEnv() func() {
+	lockEnvMutex.Lock()
+	return lockEnvMutex.Unlock
+}
+
 // SetEnvOff - turns off env lookup
+// A global lock above this MUST ensure that
 func SetEnvOff() {
 	privateMutex.Lock()
 	defer privateMutex.Unlock()
@@ -64,6 +74,16 @@ func Get(key, defaultValue string) string {
 		return v
 	}
 	return defaultValue
+}
+
+// GetInt returns an integer if found in the environment
+// and returns the default value otherwise.
+func GetInt(key string, defaultValue int) (int, error) {
+	v := Get(key, "")
+	if v == "" {
+		return defaultValue, nil
+	}
+	return strconv.Atoi(v)
 }
 
 // List all envs with a given prefix.

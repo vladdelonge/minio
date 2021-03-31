@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -43,6 +44,7 @@ import (
 	"github.com/minio/minio/cmd/crypto"
 	xhttp "github.com/minio/minio/cmd/http"
 	"github.com/minio/minio/cmd/logger"
+	"github.com/minio/minio/pkg/bucket/lifecycle"
 	"github.com/minio/minio/pkg/hash"
 	"github.com/minio/minio/pkg/ioutil"
 	"github.com/minio/minio/pkg/trie"
@@ -56,8 +58,11 @@ const (
 	mpartMetaPrefix = "multipart"
 	// MinIO Multipart meta prefix.
 	minioMetaMultipartBucket = minioMetaBucket + SlashSeparator + mpartMetaPrefix
-	// MinIO Tmp meta prefix.
+	// MinIO tmp meta prefix.
 	minioMetaTmpBucket = minioMetaBucket + "/tmp"
+	// MinIO tmp meta prefix for deleted objects.
+	minioMetaTmpDeletedBucket = minioMetaTmpBucket + "/.trash"
+
 	// DNS separator (period), used for bucket name validation.
 	dnsDelimiter = "."
 	// On compressed files bigger than this;
@@ -202,6 +207,9 @@ const SlashSeparator = "/"
 
 // retainSlash - retains slash from a path.
 func retainSlash(s string) string {
+	if s == "" {
+		return s
+	}
 	return strings.TrimSuffix(s, SlashSeparator) + SlashSeparator
 }
 
@@ -256,7 +264,7 @@ func cleanMetadata(metadata map[string]string) map[string]string {
 	// Remove STANDARD StorageClass
 	metadata = removeStandardStorageClass(metadata)
 	// Clean meta etag keys 'md5Sum', 'etag', "expires", "x-amz-tagging".
-	return cleanMetadataKeys(metadata, "md5Sum", "etag", "expires", xhttp.AmzObjectTagging)
+	return cleanMetadataKeys(metadata, "md5Sum", "etag", "expires", xhttp.AmzObjectTagging, "last-modified")
 }
 
 // Filter X-Amz-Storage-Class field only if it is set to STANDARD.
@@ -322,6 +330,10 @@ func isStringEqual(s1 string, s2 string) bool {
 
 // Ignores all reserved bucket names or invalid bucket names.
 func isReservedOrInvalidBucket(bucketEntry string, strict bool) bool {
+	if bucketEntry == "" {
+		return true
+	}
+
 	bucketEntry = strings.TrimSuffix(bucketEntry, SlashSeparator)
 	if strict {
 		if err := s3utils.CheckValidBucketNameStrict(bucketEntry); err != nil {
@@ -389,9 +401,6 @@ func (o ObjectInfo) IsCompressedOK() (bool, error) {
 	if !ok {
 		return false, nil
 	}
-	if crypto.IsEncrypted(o.UserDefined) {
-		return true, fmt.Errorf("compression %q and encryption enabled on same object", scheme)
-	}
 	switch scheme {
 	case compressionAlgorithmV1, compressionAlgorithmV2:
 		return true, nil
@@ -402,7 +411,7 @@ func (o ObjectInfo) IsCompressedOK() (bool, error) {
 // GetActualETag - returns the actual etag of the stored object
 // decrypts SSE objects.
 func (o ObjectInfo) GetActualETag(h http.Header) string {
-	if !crypto.IsEncrypted(o.UserDefined) {
+	if _, ok := crypto.IsEncrypted(o.UserDefined); !ok {
 		return o.ETag
 	}
 	return getDecryptedETag(h, o, false)
@@ -410,9 +419,6 @@ func (o ObjectInfo) GetActualETag(h http.Header) string {
 
 // GetActualSize - returns the actual size of the stored object
 func (o ObjectInfo) GetActualSize() (int64, error) {
-	if crypto.IsEncrypted(o.UserDefined) {
-		return o.DecryptedSize()
-	}
 	if o.IsCompressed() {
 		sizeStr, ok := o.UserDefined[ReservedMetadataPrefix+"actual-size"]
 		if !ok {
@@ -424,6 +430,10 @@ func (o ObjectInfo) GetActualSize() (int64, error) {
 		}
 		return size, nil
 	}
+	if _, ok := crypto.IsEncrypted(o.UserDefined); ok {
+		return o.DecryptedSize()
+	}
+
 	return o.Size, nil
 }
 
@@ -431,7 +441,12 @@ func (o ObjectInfo) GetActualSize() (int64, error) {
 // Using compression and encryption together enables room for side channel attacks.
 // Eliminate non-compressible objects by extensions/content-types.
 func isCompressible(header http.Header, object string) bool {
-	if crypto.IsRequested(header) || excludeForCompression(header, object, globalCompressConfig) {
+	globalCompressConfigMu.Lock()
+	cfg := globalCompressConfig
+	globalCompressConfigMu.Unlock()
+
+	_, ok := crypto.IsRequested(header)
+	if !cfg.Enabled || (ok && !cfg.AllowEncrypted) || excludeForCompression(header, object, cfg) {
 		return false
 	}
 	return true
@@ -451,16 +466,15 @@ func excludeForCompression(header http.Header, object string, cfg compress.Confi
 	}
 
 	// Filter compression includes.
-	if len(cfg.Extensions) == 0 || len(cfg.MimeTypes) == 0 {
-		return false
+	exclude := len(cfg.Extensions) > 0 || len(cfg.MimeTypes) > 0
+	if len(cfg.Extensions) > 0 && hasStringSuffixInSlice(objStr, cfg.Extensions) {
+		exclude = false
 	}
 
-	extensions := cfg.Extensions
-	mimeTypes := cfg.MimeTypes
-	if hasStringSuffixInSlice(objStr, extensions) || hasPattern(mimeTypes, contentType) {
-		return false
+	if len(cfg.MimeTypes) > 0 && hasPattern(cfg.MimeTypes, contentType) {
+		exclude = false
 	}
-	return true
+	return exclude
 }
 
 // Utility which returns if a string is present in the list.
@@ -494,31 +508,48 @@ func getPartFile(entriesTrie *trie.Trie, partNumber int, etag string) (partFile 
 	return partFile
 }
 
+func partNumberToRangeSpec(oi ObjectInfo, partNumber int) *HTTPRangeSpec {
+	if oi.Size == 0 || len(oi.Parts) == 0 {
+		return nil
+	}
+
+	var start int64
+	var end = int64(-1)
+	for i := 0; i < len(oi.Parts) && i < partNumber; i++ {
+		start = end + 1
+		end = start + oi.Parts[i].ActualSize - 1
+	}
+
+	return &HTTPRangeSpec{Start: start, End: end}
+}
+
 // Returns the compressed offset which should be skipped.
-func getCompressedOffsets(objectInfo ObjectInfo, offset int64) (int64, int64) {
-	var compressedOffset int64
+// If encrypted offsets are adjusted for encrypted block headers/trailers.
+// Since de-compression is after decryption encryption overhead is only added to compressedOffset.
+func getCompressedOffsets(objectInfo ObjectInfo, offset int64) (compressedOffset int64, partSkip int64, firstPart int) {
 	var skipLength int64
 	var cumulativeActualSize int64
+	var firstPartIdx int
 	if len(objectInfo.Parts) > 0 {
-		for _, part := range objectInfo.Parts {
+		for i, part := range objectInfo.Parts {
 			cumulativeActualSize += part.ActualSize
 			if cumulativeActualSize <= offset {
 				compressedOffset += part.Size
 			} else {
+				firstPartIdx = i
 				skipLength = cumulativeActualSize - part.ActualSize
 				break
 			}
 		}
 	}
-	return compressedOffset, offset - skipLength
+
+	if isEncryptedMultipart(objectInfo) && firstPartIdx > 0 {
+		off, _, _, _, _, err := objectInfo.GetDecryptedRange(partNumberToRangeSpec(objectInfo, firstPartIdx))
+		logger.LogIf(context.Background(), err)
+		compressedOffset += off
+	}
+	return compressedOffset, offset - skipLength, firstPartIdx
 }
-
-// byBucketName is a collection satisfying sort.Interface.
-type byBucketName []BucketInfo
-
-func (d byBucketName) Len() int           { return len(d) }
-func (d byBucketName) Swap(i, j int)      { d[i], d[j] = d[j], d[i] }
-func (d byBucketName) Less(i, j int) bool { return d[i].Name < d[j].Name }
 
 // GetObjectReader is a type that wraps a reader with a lock to
 // provide a ReadCloser interface that unlocks on Close()
@@ -562,6 +593,10 @@ type ObjReaderFn func(inputReader io.Reader, h http.Header, pcfn CheckPreconditi
 func NewGetObjectReader(rs *HTTPRangeSpec, oi ObjectInfo, opts ObjectOptions, cleanUpFns ...func()) (
 	fn ObjReaderFn, off, length int64, err error) {
 
+	if rs == nil && opts.PartNumber > 0 {
+		rs = partNumberToRangeSpec(oi, opts.PartNumber)
+	}
+
 	// Call the clean-up functions immediately in case of exit
 	// with error
 	defer func() {
@@ -572,19 +607,118 @@ func NewGetObjectReader(rs *HTTPRangeSpec, oi ObjectInfo, opts ObjectOptions, cl
 		}
 	}()
 
-	isEncrypted := crypto.IsEncrypted(oi.UserDefined)
+	_, isEncrypted := crypto.IsEncrypted(oi.UserDefined)
 	isCompressed, err := oi.IsCompressedOK()
 	if err != nil {
 		return nil, 0, 0, err
 	}
 
-	var skipLen int64
-	// Calculate range to read (different for
-	// e.g. encrypted/compressed objects)
+	// if object is encrypted, transition content without decrypting.
+	if opts.TransitionStatus == lifecycle.TransitionPending && (isEncrypted || isCompressed) {
+		isEncrypted = false
+		isCompressed = false
+	}
+
+	// Calculate range to read (different for encrypted/compressed objects)
 	switch {
+	case isCompressed:
+		var firstPart int
+		if opts.PartNumber > 0 {
+			// firstPart is an index to Parts slice,
+			// make sure that PartNumber uses the
+			// index value properly.
+			firstPart = opts.PartNumber - 1
+		}
+
+		// If compressed, we start from the beginning of the part.
+		// Read the decompressed size from the meta.json.
+		actualSize, err := oi.GetActualSize()
+		if err != nil {
+			return nil, 0, 0, err
+		}
+		off, length = int64(0), oi.Size
+		decOff, decLength := int64(0), actualSize
+		if rs != nil {
+			off, length, err = rs.GetOffsetLength(actualSize)
+			if err != nil {
+				return nil, 0, 0, err
+			}
+			// In case of range based queries on multiparts, the offset and length are reduced.
+			off, decOff, firstPart = getCompressedOffsets(oi, off)
+			decLength = length
+			length = oi.Size - off
+			// For negative length we read everything.
+			if decLength < 0 {
+				decLength = actualSize - decOff
+			}
+
+			// Reply back invalid range if the input offset and length fall out of range.
+			if decOff > actualSize || decOff+decLength > actualSize {
+				return nil, 0, 0, errInvalidRange
+			}
+		}
+		fn = func(inputReader io.Reader, h http.Header, pcfn CheckPreconditionFn, cFns ...func()) (r *GetObjectReader, err error) {
+			cFns = append(cleanUpFns, cFns...)
+			if opts.CheckPrecondFn != nil && opts.CheckPrecondFn(oi) {
+				// Call the cleanup funcs
+				for i := len(cFns) - 1; i >= 0; i-- {
+					cFns[i]()
+				}
+				return nil, PreConditionFailed{}
+			}
+			if isEncrypted {
+				copySource := h.Get(xhttp.AmzServerSideEncryptionCopyCustomerAlgorithm) != ""
+				// Attach decrypter on inputReader
+				inputReader, err = DecryptBlocksRequestR(inputReader, h, 0, firstPart, oi, copySource)
+				if err != nil {
+					// Call the cleanup funcs
+					for i := len(cFns) - 1; i >= 0; i-- {
+						cFns[i]()
+					}
+					return nil, err
+				}
+				oi.Size = decLength
+			}
+			// Decompression reader.
+			s2Reader := s2.NewReader(inputReader)
+			// Apply the skipLen and limit on the decompressed stream.
+			if decOff > 0 {
+				if err = s2Reader.Skip(decOff); err != nil {
+					// Call the cleanup funcs
+					for i := len(cFns) - 1; i >= 0; i-- {
+						cFns[i]()
+					}
+					return nil, err
+				}
+			}
+
+			decReader := io.LimitReader(s2Reader, decLength)
+			if decLength > compReadAheadSize {
+				rah, err := readahead.NewReaderSize(decReader, compReadAheadBuffers, compReadAheadBufSize)
+				if err == nil {
+					decReader = rah
+					cFns = append(cFns, func() {
+						rah.Close()
+					})
+				}
+			}
+			oi.Size = decLength
+
+			// Assemble the GetObjectReader
+			r = &GetObjectReader{
+				ObjInfo:    oi,
+				pReader:    decReader,
+				cleanUpFns: cFns,
+				opts:       opts,
+			}
+			return r, nil
+		}
+
 	case isEncrypted:
 		var seqNumber uint32
 		var partStart int
+		var skipLen int64
+
 		off, length, skipLen, seqNumber, partStart, err = oi.GetDecryptedRange(rs)
 		if err != nil {
 			return nil, 0, 0, err
@@ -605,13 +739,12 @@ func NewGetObjectReader(rs *HTTPRangeSpec, oi ObjectInfo, opts ObjectOptions, cl
 		// encrypted bytes. The header parameter is used to
 		// provide encryption parameters.
 		fn = func(inputReader io.Reader, h http.Header, pcfn CheckPreconditionFn, cFns ...func()) (r *GetObjectReader, err error) {
-			copySource := h.Get(crypto.SSECopyAlgorithm) != ""
+			copySource := h.Get(xhttp.AmzServerSideEncryptionCopyCustomerAlgorithm) != ""
 
 			cFns = append(cleanUpFns, cFns...)
 			// Attach decrypter on inputReader
 			var decReader io.Reader
-			decReader, err = DecryptBlocksRequestR(inputReader, h,
-				off, length, seqNumber, partStart, oi, copySource)
+			decReader, err = DecryptBlocksRequestR(inputReader, h, seqNumber, partStart, oi, copySource)
 			if err != nil {
 				// Call the cleanup funcs
 				for i := len(cFns) - 1; i >= 0; i-- {
@@ -633,76 +766,6 @@ func NewGetObjectReader(rs *HTTPRangeSpec, oi ObjectInfo, opts ObjectOptions, cl
 			// Apply the skipLen and limit on the
 			// decrypted stream
 			decReader = io.LimitReader(ioutil.NewSkipReader(decReader, skipLen), decRangeLength)
-
-			// Assemble the GetObjectReader
-			r = &GetObjectReader{
-				ObjInfo:    oi,
-				pReader:    decReader,
-				cleanUpFns: cFns,
-				opts:       opts,
-			}
-			return r, nil
-		}
-	case isCompressed:
-		// Read the decompressed size from the meta.json.
-		actualSize, err := oi.GetActualSize()
-		if err != nil {
-			return nil, 0, 0, err
-		}
-		off, length = int64(0), oi.Size
-		decOff, decLength := int64(0), actualSize
-		if rs != nil {
-			off, length, err = rs.GetOffsetLength(actualSize)
-			if err != nil {
-				return nil, 0, 0, err
-			}
-			// In case of range based queries on multiparts, the offset and length are reduced.
-			off, decOff = getCompressedOffsets(oi, off)
-			decLength = length
-			length = oi.Size - off
-
-			// For negative length we read everything.
-			if decLength < 0 {
-				decLength = actualSize - decOff
-			}
-
-			// Reply back invalid range if the input offset and length fall out of range.
-			if decOff > actualSize || decOff+decLength > actualSize {
-				return nil, 0, 0, errInvalidRange
-			}
-		}
-		fn = func(inputReader io.Reader, _ http.Header, pcfn CheckPreconditionFn, cFns ...func()) (r *GetObjectReader, err error) {
-			cFns = append(cleanUpFns, cFns...)
-			if opts.CheckPrecondFn != nil && opts.CheckPrecondFn(oi) {
-				// Call the cleanup funcs
-				for i := len(cFns) - 1; i >= 0; i-- {
-					cFns[i]()
-				}
-				return nil, PreConditionFailed{}
-			}
-			// Decompression reader.
-			s2Reader := s2.NewReader(inputReader)
-			// Apply the skipLen and limit on the decompressed stream.
-			err = s2Reader.Skip(decOff)
-			if err != nil {
-				// Call the cleanup funcs
-				for i := len(cFns) - 1; i >= 0; i-- {
-					cFns[i]()
-				}
-				return nil, err
-			}
-
-			decReader := io.LimitReader(s2Reader, decLength)
-			if decLength > compReadAheadSize {
-				rah, err := readahead.NewReaderSize(decReader, compReadAheadBuffers, compReadAheadBufSize)
-				if err == nil {
-					decReader = rah
-					cFns = append(cFns, func() {
-						rah.Close()
-					})
-				}
-			}
-			oi.Size = decLength
 
 			// Assemble the GetObjectReader
 			r = &GetObjectReader{
@@ -809,17 +872,23 @@ func (p *PutObjReader) MD5CurrentHexString() string {
 	return hex.EncodeToString(md5sumCurr)
 }
 
-// NewPutObjReader returns a new PutObjReader and holds
-// reference to underlying data stream from client and the encrypted
-// data reader
-func NewPutObjReader(rawReader *hash.Reader, encReader *hash.Reader, key *crypto.ObjectKey) *PutObjReader {
-	p := PutObjReader{Reader: rawReader, rawReader: rawReader}
-
-	if key != nil && encReader != nil {
-		p.sealMD5Fn = sealETagFn(*key)
-		p.Reader = encReader
+// WithEncryption sets up encrypted reader and the sealing for content md5sum
+// using objEncKey. Unsealed md5sum is computed from the rawReader setup when
+// NewPutObjReader was called. It returns an error if called on an uninitialized
+// PutObjReader.
+func (p *PutObjReader) WithEncryption(encReader *hash.Reader, objEncKey *crypto.ObjectKey) (*PutObjReader, error) {
+	if p.Reader == nil {
+		return nil, errors.New("put-object reader uninitialized")
 	}
-	return &p
+	p.Reader = encReader
+	p.sealMD5Fn = sealETagFn(*objEncKey)
+	return p, nil
+}
+
+// NewPutObjReader returns a new PutObjReader. It uses given hash.Reader's
+// MD5Current method to construct md5sum when requested downstream.
+func NewPutObjReader(rawReader *hash.Reader) *PutObjReader {
+	return &PutObjReader{Reader: rawReader, rawReader: rawReader}
 }
 
 func sealETag(encKey crypto.ObjectKey, md5CurrSum []byte) []byte {
@@ -853,20 +922,30 @@ func CleanMinioInternalMetadataKeys(metadata map[string]string) map[string]strin
 
 // newS2CompressReader will read data from r, compress it and return the compressed data as a Reader.
 // Use Close to ensure resources are released on incomplete streams.
-func newS2CompressReader(r io.Reader) io.ReadCloser {
+//
+// input 'on' is always recommended such that this function works
+// properly, because we do not wish to create an object even if
+// client closed the stream prematurely.
+func newS2CompressReader(r io.Reader, on int64) io.ReadCloser {
 	pr, pw := io.Pipe()
 	comp := s2.NewWriter(pw)
 	// Copy input to compressor
 	go func() {
-		_, err := io.Copy(comp, r)
+		cn, err := io.Copy(comp, r)
 		if err != nil {
 			comp.Close()
 			pw.CloseWithError(err)
 			return
 		}
+		if on > 0 && on != cn {
+			// if client didn't sent all data
+			// from the client verify here.
+			comp.Close()
+			pw.CloseWithError(IncompleteBody{})
+			return
+		}
 		// Close the stream.
-		err = comp.Close()
-		if err != nil {
+		if err = comp.Close(); err != nil {
 			pw.CloseWithError(err)
 			return
 		}

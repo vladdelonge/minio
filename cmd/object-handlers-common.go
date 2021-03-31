@@ -26,8 +26,6 @@ import (
 
 	xhttp "github.com/minio/minio/cmd/http"
 	"github.com/minio/minio/pkg/bucket/lifecycle"
-	"github.com/minio/minio/pkg/event"
-	"github.com/minio/minio/pkg/handlers"
 )
 
 var (
@@ -162,8 +160,8 @@ func checkPreconditions(ctx context.Context, w http.ResponseWriter, r *http.Requ
 
 	// Check if the part number is correct.
 	if opts.PartNumber > 1 && opts.PartNumber > len(objInfo.Parts) {
-		writeHeaders()
-		w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+		// According to S3 we don't need to set any object information here.
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrInvalidPartNumber), r.URL, guessIsBrowserReq(r))
 		return true
 	}
 
@@ -261,56 +259,21 @@ func setPutObjHeaders(w http.ResponseWriter, objInfo ObjectInfo, delete bool) {
 		}
 	}
 
-	if lc, err := globalLifecycleSys.Get(objInfo.Bucket); err == nil && !delete {
-		ruleID, expiryTime := lc.PredictExpiryTime(lifecycle.ObjectOpts{
-			Name:         objInfo.Name,
-			UserTags:     objInfo.UserTags,
-			VersionID:    objInfo.VersionID,
-			ModTime:      objInfo.ModTime,
-			IsLatest:     objInfo.IsLatest,
-			DeleteMarker: objInfo.DeleteMarker,
-		})
-		if !expiryTime.IsZero() {
-			w.Header()[xhttp.AmzExpiration] = []string{
-				fmt.Sprintf(`expiry-date="%s", rule-id="%s"`, expiryTime.Format(http.TimeFormat), ruleID),
+	if objInfo.Bucket != "" && objInfo.Name != "" {
+		if lc, err := globalLifecycleSys.Get(objInfo.Bucket); err == nil && !delete {
+			ruleID, expiryTime := lc.PredictExpiryTime(lifecycle.ObjectOpts{
+				Name:         objInfo.Name,
+				UserTags:     objInfo.UserTags,
+				VersionID:    objInfo.VersionID,
+				ModTime:      objInfo.ModTime,
+				IsLatest:     objInfo.IsLatest,
+				DeleteMarker: objInfo.DeleteMarker,
+			})
+			if !expiryTime.IsZero() {
+				w.Header()[xhttp.AmzExpiration] = []string{
+					fmt.Sprintf(`expiry-date="%s", rule-id="%s"`, expiryTime.Format(http.TimeFormat), ruleID),
+				}
 			}
 		}
 	}
-}
-
-// deleteObject is a convenient wrapper to delete an object, this
-// is a common function to be called from object handlers and
-// web handlers.
-func deleteObject(ctx context.Context, obj ObjectLayer, cache CacheObjectLayer, bucket, object string, r *http.Request, opts ObjectOptions) (objInfo ObjectInfo, err error) {
-	deleteObject := obj.DeleteObject
-	if cache != nil {
-		deleteObject = cache.DeleteObject
-	}
-	// Proceed to delete the object.
-	objInfo, err = deleteObject(ctx, bucket, object, opts)
-	if objInfo.Name != "" {
-		// Requesting only a delete marker which was successfully attempted.
-		if objInfo.DeleteMarker {
-			// Notify object deleted marker event.
-			sendEvent(eventArgs{
-				EventName:  event.ObjectRemovedDeleteMarkerCreated,
-				BucketName: bucket,
-				Object:     objInfo,
-				ReqParams:  extractReqParams(r),
-				UserAgent:  r.UserAgent(),
-				Host:       handlers.GetSourceIP(r),
-			})
-		} else {
-			// Notify object deleted event.
-			sendEvent(eventArgs{
-				EventName:  event.ObjectRemovedDelete,
-				BucketName: bucket,
-				Object:     objInfo,
-				ReqParams:  extractReqParams(r),
-				UserAgent:  r.UserAgent(),
-				Host:       handlers.GetSourceIP(r),
-			})
-		}
-	}
-	return objInfo, err
 }

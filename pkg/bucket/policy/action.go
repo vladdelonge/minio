@@ -68,6 +68,9 @@ const (
 	// ListBucketAction - ListBucket Rest API action.
 	ListBucketAction = "s3:ListBucket"
 
+	// GetBucketPolicyStatusAction - Retrieves the policy status for a bucket.
+	GetBucketPolicyStatusAction = "s3:GetBucketPolicyStatus"
+
 	// ListBucketMultipartUploadsAction - ListMultipartUploads Rest API action.
 	ListBucketMultipartUploadsAction = "s3:ListBucketMultipartUploads"
 
@@ -169,6 +172,9 @@ const (
 
 	// GetObjectVersionForReplicationAction  - GetObjectVersionForReplication REST API action
 	GetObjectVersionForReplicationAction = "s3:GetObjectVersionForReplication"
+
+	// RestoreObjectAction - RestoreObject REST API action
+	RestoreObjectAction = "s3:RestoreObject"
 )
 
 // List of all supported object actions.
@@ -195,6 +201,7 @@ var supportedObjectActions = map[Action]struct{}{
 	ReplicateDeleteAction:                {},
 	ReplicateTagsAction:                  {},
 	GetObjectVersionForReplicationAction: {},
+	RestoreObjectAction:                  {},
 }
 
 // isObjectAction - returns whether action is object type or not.
@@ -218,6 +225,7 @@ var supportedActions = map[Action]struct{}{
 	HeadBucketAction:                       {},
 	ListAllMyBucketsAction:                 {},
 	ListBucketAction:                       {},
+	GetBucketPolicyStatusAction:            {},
 	ListBucketVersionsAction:               {},
 	ListBucketMultipartUploadsAction:       {},
 	ListenNotificationAction:               {},
@@ -255,6 +263,7 @@ var supportedActions = map[Action]struct{}{
 	ReplicateDeleteAction:                  {},
 	ReplicateTagsAction:                    {},
 	GetObjectVersionForReplicationAction:   {},
+	RestoreObjectAction:                    {},
 }
 
 // IsValid - checks if action is valid or not.
@@ -309,6 +318,8 @@ var actionConditionKeyMap = map[Action]condition.KeySet{
 	DeleteObjectAction: condition.NewKeySet(condition.CommonKeys...),
 
 	GetBucketLocationAction: condition.NewKeySet(condition.CommonKeys...),
+
+	GetBucketPolicyStatusAction: condition.NewKeySet(condition.CommonKeys...),
 
 	GetObjectAction: condition.NewKeySet(
 		append([]condition.Key{
@@ -410,4 +421,5 @@ var actionConditionKeyMap = map[Action]condition.KeySet{
 	ReplicateDeleteAction:                condition.NewKeySet(condition.CommonKeys...),
 	ReplicateTagsAction:                  condition.NewKeySet(condition.CommonKeys...),
 	GetObjectVersionForReplicationAction: condition.NewKeySet(condition.CommonKeys...),
+	RestoreObjectAction:                  condition.NewKeySet(condition.CommonKeys...),
 }

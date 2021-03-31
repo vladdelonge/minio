@@ -39,6 +39,7 @@ type Target struct {
 	// Channel of log entries
 	logCh chan interface{}
 
+	name string
 	// HTTP(s) endpoint
 	endpoint string
 	// Authorization token for `endpoint`
@@ -47,6 +48,15 @@ type Target struct {
 	userAgent string
 	logKind   string
 	client    http.Client
+}
+
+// Endpoint returns the backend endpoint
+func (h *Target) Endpoint() string {
+	return h.endpoint
+}
+
+func (h *Target) String() string {
+	return h.name
 }
 
 // Validate validate the http target
@@ -120,8 +130,8 @@ func (h *Target) startHTTPLogger() {
 			resp, err := h.client.Do(req)
 			cancel()
 			if err != nil {
-				logger.LogIf(ctx, fmt.Errorf("%s returned '%w', please check your endpoint configuration\n",
-					h.endpoint, err))
+				logger.LogOnceIf(ctx, fmt.Errorf("%s returned '%w', please check your endpoint configuration",
+					h.endpoint, err), h.endpoint)
 				continue
 			}
 
@@ -131,11 +141,11 @@ func (h *Target) startHTTPLogger() {
 			if resp.StatusCode != http.StatusOK {
 				switch resp.StatusCode {
 				case http.StatusForbidden:
-					logger.LogIf(ctx, fmt.Errorf("%s returned '%s', please check if your auth token is correctly set",
-						h.endpoint, resp.Status))
+					logger.LogOnceIf(ctx, fmt.Errorf("%s returned '%s', please check if your auth token is correctly set",
+						h.endpoint, resp.Status), h.endpoint)
 				default:
-					logger.LogIf(ctx, fmt.Errorf("%s returned '%s', please check your endpoint configuration",
-						h.endpoint, resp.Status))
+					logger.LogOnceIf(ctx, fmt.Errorf("%s returned '%s', please check your endpoint configuration",
+						h.endpoint, resp.Status), h.endpoint)
 				}
 			}
 		}
@@ -144,6 +154,13 @@ func (h *Target) startHTTPLogger() {
 
 // Option is a function type that accepts a pointer Target
 type Option func(*Target)
+
+// WithTargetName target name
+func WithTargetName(name string) Option {
+	return func(t *Target) {
+		t.name = name
+	}
+}
 
 // WithEndpoint adds a new endpoint
 func WithEndpoint(endpoint string) Option {

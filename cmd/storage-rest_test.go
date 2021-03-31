@@ -82,8 +82,8 @@ func testStorageAPIListVols(t *testing.T, storage StorageAPI) {
 		expectedResult []VolInfo
 		expectErr      bool
 	}{
-		{nil, []VolInfo{}, false},
-		{[]string{"foo"}, []VolInfo{{Name: "foo"}}, false},
+		{nil, []VolInfo{{Name: ".minio.sys"}}, false},
+		{[]string{"foo"}, []VolInfo{{Name: ".minio.sys"}, {Name: "foo"}}, false},
 	}
 
 	for i, testCase := range testCases {
@@ -362,7 +362,7 @@ func testStorageAPIDeleteFile(t *testing.T, storage StorageAPI) {
 	}
 
 	for i, testCase := range testCases {
-		err := storage.DeleteFile(context.Background(), testCase.volumeName, testCase.objectName)
+		err := storage.Delete(context.Background(), testCase.volumeName, testCase.objectName, false)
 		expectErr := (err != nil)
 
 		if expectErr != testCase.expectErr {
@@ -446,15 +446,15 @@ func newStorageRESTHTTPServerClient(t *testing.T) (*httptest.Server, *storageRES
 		t.Fatalf("UpdateIsLocal failed %v", err)
 	}
 
-	registerStorageRESTHandlers(router, []ZoneEndpoints{{
+	registerStorageRESTHandlers(router, []PoolEndpoints{{
 		Endpoints: Endpoints{endpoint},
 	}})
 
 	prevGlobalServerConfig := globalServerConfig
 	globalServerConfig = newServerConfig()
-	lookupConfigs(globalServerConfig, 0)
+	lookupConfigs(globalServerConfig, nil)
 
-	restClient := newStorageRESTClient(endpoint)
+	restClient := newStorageRESTClient(endpoint, false)
 
 	return httpServer, restClient, prevGlobalServerConfig, endpointPath
 }

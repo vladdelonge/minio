@@ -20,8 +20,6 @@ import (
 	"net/http"
 
 	"github.com/gorilla/mux"
-	"github.com/minio/minio/cmd/config"
-	"github.com/minio/minio/pkg/env"
 	"github.com/minio/minio/pkg/madmin"
 )
 
@@ -112,11 +110,10 @@ func registerAdminRouter(router *mux.Router, enableConfigOps, enableIAMOps bool)
 			// -- IAM APIs --
 
 			// Add policy IAM
-			adminRouter.Methods(http.MethodPut).Path(adminVersion+"/add-canned-policy").HandlerFunc(httpTraceHdrs(adminAPI.AddCannedPolicy)).Queries("name", "{name:.*}")
+			adminRouter.Methods(http.MethodPut).Path(adminVersion+"/add-canned-policy").HandlerFunc(httpTraceAll(adminAPI.AddCannedPolicy)).Queries("name", "{name:.*}")
 
 			// Add user IAM
-
-			adminRouter.Methods(http.MethodGet).Path(adminVersion + "/accountusageinfo").HandlerFunc(httpTraceAll(adminAPI.AccountUsageInfoHandler))
+			adminRouter.Methods(http.MethodGet).Path(adminVersion + "/accountinfo").HandlerFunc(httpTraceAll(adminAPI.AccountInfoHandler))
 
 			adminRouter.Methods(http.MethodPut).Path(adminVersion+"/add-user").HandlerFunc(httpTraceHdrs(adminAPI.AddUser)).Queries("accessKey", "{accessKey:.*}")
 
@@ -172,15 +169,13 @@ func registerAdminRouter(router *mux.Router, enableConfigOps, enableIAMOps bool)
 		}
 
 		if globalIsDistErasure || globalIsErasure {
-			// Quota operations
-			if env.Get(envDataUsageCrawlConf, config.EnableOn) == config.EnableOn {
-				// GetBucketQuotaConfig
-				adminRouter.Methods(http.MethodGet).Path(adminVersion+"/get-bucket-quota").HandlerFunc(
-					httpTraceHdrs(adminAPI.GetBucketQuotaConfigHandler)).Queries("bucket", "{bucket:.*}")
-				// PutBucketQuotaConfig
-				adminRouter.Methods(http.MethodPut).Path(adminVersion+"/set-bucket-quota").HandlerFunc(
-					httpTraceHdrs(adminAPI.PutBucketQuotaConfigHandler)).Queries("bucket", "{bucket:.*}")
-			}
+			// GetBucketQuotaConfig
+			adminRouter.Methods(http.MethodGet).Path(adminVersion+"/get-bucket-quota").HandlerFunc(
+				httpTraceHdrs(adminAPI.GetBucketQuotaConfigHandler)).Queries("bucket", "{bucket:.*}")
+			// PutBucketQuotaConfig
+			adminRouter.Methods(http.MethodPut).Path(adminVersion+"/set-bucket-quota").HandlerFunc(
+				httpTraceHdrs(adminAPI.PutBucketQuotaConfigHandler)).Queries("bucket", "{bucket:.*}")
+
 			// Bucket replication operations
 			// GetBucketTargetHandler
 			adminRouter.Methods(http.MethodGet).Path(adminVersion+"/list-remote-targets").HandlerFunc(
@@ -188,15 +183,17 @@ func registerAdminRouter(router *mux.Router, enableConfigOps, enableIAMOps bool)
 			// SetRemoteTargetHandler
 			adminRouter.Methods(http.MethodPut).Path(adminVersion+"/set-remote-target").HandlerFunc(
 				httpTraceHdrs(adminAPI.SetRemoteTargetHandler)).Queries("bucket", "{bucket:.*}")
-			// SetRemoteTargetHandler
+			// RemoveRemoteTargetHandler
 			adminRouter.Methods(http.MethodDelete).Path(adminVersion+"/remove-remote-target").HandlerFunc(
 				httpTraceHdrs(adminAPI.RemoveRemoteTargetHandler)).Queries("bucket", "{bucket:.*}", "arn", "{arn:.*}")
 		}
 
-		// -- Top APIs --
-		// Top locks
 		if globalIsDistErasure {
+			// Top locks
 			adminRouter.Methods(http.MethodGet).Path(adminVersion + "/top/locks").HandlerFunc(httpTraceHdrs(adminAPI.TopLocksHandler))
+			// Force unlocks paths
+			adminRouter.Methods(http.MethodPost).Path(adminVersion+"/force-unlock").
+				Queries("paths", "{paths:.*}").HandlerFunc(httpTraceHdrs(adminAPI.ForceUnlockHandler))
 		}
 
 		// HTTP Trace
@@ -211,13 +208,18 @@ func registerAdminRouter(router *mux.Router, enableConfigOps, enableIAMOps bool)
 		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/kms/key/status").HandlerFunc(httpTraceAll(adminAPI.KMSKeyStatusHandler))
 
 		if !globalIsGateway {
-			// -- OBD API --
+			// Keep obdinfo for backward compatibility with mc
 			adminRouter.Methods(http.MethodGet).Path(adminVersion + "/obdinfo").
-				HandlerFunc(httpTraceHdrs(adminAPI.OBDInfoHandler))
+				HandlerFunc(httpTraceHdrs(adminAPI.HealthInfoHandler))
+			// -- Health API --
+			adminRouter.Methods(http.MethodGet).Path(adminVersion + "/healthinfo").
+				HandlerFunc(httpTraceHdrs(adminAPI.HealthInfoHandler))
+			adminRouter.Methods(http.MethodGet).Path(adminVersion + "/bandwidth").
+				HandlerFunc(httpTraceHdrs(adminAPI.BandwidthMonitorHandler))
 		}
 	}
 
 	// If none of the routes match add default error handler routes
 	adminRouter.NotFoundHandler = httpTraceAll(errorResponseHandler)
-	adminRouter.MethodNotAllowedHandler = httpTraceAll(errorResponseHandler)
+	adminRouter.MethodNotAllowedHandler = httpTraceAll(methodNotAllowedHandler("Admin"))
 }

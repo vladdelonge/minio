@@ -21,6 +21,7 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/hex"
+	"errors"
 	"io/ioutil"
 	"os"
 	"path"
@@ -36,7 +37,7 @@ func md5Header(data []byte) map[string]string {
 
 // Wrapper for calling PutObject tests for both Erasure multiple disks and single node setup.
 func TestObjectAPIPutObjectSingle(t *testing.T) {
-	ExecObjectLayerTest(t, testObjectAPIPutObject)
+	ExecExtendedObjectLayerTest(t, testObjectAPIPutObject)
 }
 
 // Tests validate correctness of PutObject.
@@ -224,8 +225,8 @@ func testObjectAPIPutObjectDiskNotFound(obj ObjectLayer, instanceType string, di
 		t.Fatalf("%s : %s", instanceType, err.Error())
 	}
 
-	// Take 8 disks down, one more we loose quorum on 16 disk node.
-	for _, disk := range disks[:7] {
+	// Take 4 disks down, one more we loose quorum on 16 disk node.
+	for _, disk := range disks[:4] {
 		os.RemoveAll(disk)
 	}
 
@@ -296,7 +297,7 @@ func testObjectAPIPutObjectDiskNotFound(obj ObjectLayer, instanceType string, di
 		int64(len("mnop")),
 		false,
 		"",
-		InsufficientWriteQuorum{},
+		errErasureWriteQuorum,
 	}
 
 	_, actualErr := obj.PutObject(context.Background(), testCase.bucketName, testCase.objName, mustGetPutObjReader(t, bytes.NewReader(testCase.inputData), testCase.intputDataSize, testCase.inputMeta["etag"], sha256sum), ObjectOptions{UserDefined: testCase.inputMeta})
@@ -305,7 +306,7 @@ func testObjectAPIPutObjectDiskNotFound(obj ObjectLayer, instanceType string, di
 	}
 	// Failed as expected, but does it fail for the expected reason.
 	if actualErr != nil && !testCase.shouldPass {
-		if testCase.expectedError.Error() != actualErr.Error() {
+		if !errors.Is(actualErr, testCase.expectedError) {
 			t.Errorf("Test %d: %s: Expected to fail with error \"%s\", but instead failed with error \"%s\" instead.", len(testCases)+1, instanceType, testCase.expectedError.Error(), actualErr.Error())
 		}
 	}
@@ -339,8 +340,19 @@ func testObjectAPIPutObjectStaleFiles(obj ObjectLayer, instanceType string, disk
 
 	for _, disk := range disks {
 		tmpMetaDir := path.Join(disk, minioMetaTmpBucket)
-		if !isDirEmpty(tmpMetaDir) {
-			t.Fatalf("%s: expected: empty, got: non-empty", minioMetaTmpBucket)
+		files, err := ioutil.ReadDir(tmpMetaDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var found bool
+		for _, fi := range files {
+			if fi.Name() == ".trash" {
+				continue
+			}
+			found = true
+		}
+		if found {
+			t.Fatalf("%s: expected: empty, got: non-empty %#v", minioMetaTmpBucket, files)
 		}
 	}
 }
@@ -409,7 +421,7 @@ func testObjectAPIMultipartPutObjectStaleFiles(obj ObjectLayer, instanceType str
 		files, err := ioutil.ReadDir(tmpMetaDir)
 		if err != nil {
 			// Its OK to have non-existen tmpMetaDir.
-			if os.IsNotExist(err) {
+			if osIsNotExist(err) {
 				continue
 			}
 
@@ -417,8 +429,17 @@ func testObjectAPIMultipartPutObjectStaleFiles(obj ObjectLayer, instanceType str
 			t.Errorf("%s", err)
 		}
 
-		if len(files) != 0 {
-			t.Fatalf("%s: expected: empty, got: non-empty. content: %s", tmpMetaDir, files)
+		var found bool
+		for _, fi := range files {
+			if fi.Name() == ".trash" {
+				continue
+			}
+			found = true
+			break
+		}
+
+		if found {
+			t.Fatalf("%s: expected: empty, got: non-empty. content: %#v", tmpMetaDir, files)
 		}
 	}
 }

@@ -30,6 +30,7 @@ import (
 
 	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio/cmd/config"
+	"github.com/minio/minio/cmd/config/api"
 	"github.com/minio/minio/pkg/certs"
 	"github.com/minio/minio/pkg/env"
 )
@@ -56,8 +57,8 @@ type Server struct {
 }
 
 // GetRequestCount - returns number of request in progress.
-func (srv *Server) GetRequestCount() int32 {
-	return atomic.LoadInt32(&srv.requestCount)
+func (srv *Server) GetRequestCount() int {
+	return int(atomic.LoadInt32(&srv.requestCount))
 }
 
 // Start - start HTTP server
@@ -180,13 +181,9 @@ var secureCipherSuites = []uint16{
 // Go only provides constant-time implementations of Curve25519 and NIST P-256 curve.
 var secureCurves = []tls.CurveID{tls.X25519, tls.CurveP256}
 
-const (
-	enableSecureCiphersEnv = "MINIO_API_SECURE_CIPHERS"
-)
-
 // NewServer - creates new HTTP server using given arguments.
 func NewServer(addrs []string, handler http.Handler, getCert certs.GetCertificateFunc) *Server {
-	secureCiphers := env.Get(enableSecureCiphersEnv, config.EnableOn) == config.EnableOn
+	secureCiphers := env.Get(api.EnvAPISecureCiphers, config.EnableOn) == config.EnableOn
 
 	var tlsConfig *tls.Config
 	if getCert != nil {
@@ -194,7 +191,7 @@ func NewServer(addrs []string, handler http.Handler, getCert certs.GetCertificat
 			// TLS hardening
 			PreferServerCipherSuites: true,
 			MinVersion:               tls.VersionTLS12,
-			NextProtos:               []string{"h2", "http/1.1"},
+			NextProtos:               []string{"http/1.1", "h2"},
 		}
 		tlsConfig.GetCertificate = getCert
 	}

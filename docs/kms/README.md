@@ -27,8 +27,8 @@ export MINIO_KMS_KES_KEY_NAME=my-minio-key
 #### 3. Start the MinIO Server
 
 ```sh
-export MINIO_ACCESS_KEY=minio
-export MINIO_SECRET_KEY=minio123
+export MINIO_ROOT_USER=minio
+export MINIO_ROOT_PASSWORD=minio123
 minio server ~/export
 ```
 
@@ -53,11 +53,14 @@ In a given setup, there are `n` MinIO instances talking to `m` KES servers but o
 
 The main difference between various MinIO-KMS deployments is the KMS implementation. The following table helps you select the right option for your use case:
 
-| KMS                                                                              | Purpose                                                           |
-|:---------------------------------------------------------------------------------|:------------------------------------------------------------------|
-| [Hashicorp Vault](https://github.com/minio/kes/wiki/Hashicorp-Vault-Keystore)    | Local KMS. MinIO and KMS on-prem (**Recommended**)                |
-| [AWS-KMS + SecretsManager](https://github.com/minio/kes/wiki/AWS-SecretsManager) | Cloud KMS. MinIO in combination with a managed KMS installation   |
-| [FS](https://github.com/minio/kes/wiki/Filesystem-Keystore)                      | Local testing or development (**Not recommended for production**) |
+| KMS                                                                                          | Purpose                                                           |
+|:---------------------------------------------------------------------------------------------|:------------------------------------------------------------------|
+| [Hashicorp Vault](https://github.com/minio/kes/wiki/Hashicorp-Vault-Keystore)                | Local KMS. MinIO and KMS on-prem (**Recommended**)                |
+| [AWS-KMS + SecretsManager](https://github.com/minio/kes/wiki/AWS-SecretsManager)             | Cloud KMS. MinIO in combination with a managed KMS installation   |
+| [Gemalto KeySecure /Thales CipherTrust](https://github.com/minio/kes/wiki/Gemalto-KeySecure) | Local KMS. MinIO and KMS On-Premises.                             |
+| [Google Cloud Platform SecretManager](https://github.com/minio/kes/wiki/GCP-SecretManager)   | Cloud KMS. MinIO in combination with a managed KMS installation   |
+| [FS](https://github.com/minio/kes/wiki/Filesystem-Keystore)                                  | Local testing or development (**Not recommended for production**) |
+
 
 The MinIO-KES configuration is always the same - regardless of the underlying KMS implementation. Checkout the MinIO-KES [configuration example](https://github.com/minio/kes/wiki/MinIO-Object-Storage).
 
@@ -74,7 +77,7 @@ Auto-Encryption is useful when MinIO administrator wants to ensure that all data
 ### Using `mc encrypt` (recommended)
 MinIO automatically encrypts all objects on buckets if KMS is successfully configured and bucket encryption configuration is enabled for each bucket as shown below:
 ```
-mc encrypt sse-s3 myminio/bucket/
+mc encrypt set sse-s3 myminio/bucket/
 ```
 
 Verify if MinIO has `sse-s3` enabled
@@ -84,7 +87,7 @@ Auto encryption 'sse-s3' is enabled
 ```
 
 ### Using environment (deprecated)
-> NOTE: Following ENV might be removed in future, you are advised to move to previous recommeneded approach using `mc encrypt`. S3 gateway supports encryption at gateway layer which may thus be dropped in favor of simplicity, it is advised that S3 gateway users migrate to MinIO server mode or enable encryption at REST at the backend.
+> NOTE: The following ENV might be removed in future, you are advised to move to the previously recommended approach using `mc encrypt`. S3 gateway supports encryption at gateway layer which may  be dropped in favor of simplicity at a later time. It is advised that S3 gateway users migrate to MinIO server mode or enable encryption at REST at the backend.
 
 MinIO automatically encrypts all objects on buckets if KMS is successfully configured and following ENV is enabled:
 ```

@@ -18,14 +18,16 @@ package cmd
 
 import (
 	"fmt"
+	"io/fs"
 	"net/http"
 
-	assetfs "github.com/elazarl/go-bindata-assetfs"
 	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
-	jsonrpc "github.com/gorilla/rpc/v2"
-	"github.com/gorilla/rpc/v2/json2"
+
 	"github.com/minio/minio/browser"
+	"github.com/minio/minio/cmd/logger"
+	jsonrpc "github.com/minio/minio/pkg/rpc"
+	"github.com/minio/minio/pkg/rpc/json2"
 )
 
 // webAPI container for Web API.
@@ -45,15 +47,6 @@ func (h indexHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 const assetPrefix = "production"
-
-func assetFS() *assetfs.AssetFS {
-	return &assetfs.AssetFS{
-		Asset:     browser.Asset,
-		AssetDir:  browser.AssetDir,
-		AssetInfo: browser.AssetInfo,
-		Prefix:    assetPrefix,
-	}
-}
 
 // specialAssets are files which are unique files not embedded inside index_bundle.js.
 const specialAssets = "index_bundle.*.js|loader.css|logo.svg|firefox.png|safari.png|chrome.png|favicon-16x16.png|favicon-32x32.png|favicon-96x96.png"
@@ -76,9 +69,24 @@ func registerWebRouter(router *mux.Router) error {
 	webRPC := jsonrpc.NewServer()
 	webRPC.RegisterCodec(codec, "application/json")
 	webRPC.RegisterCodec(codec, "application/json; charset=UTF-8")
+	webRPC.RegisterAfterFunc(func(ri *jsonrpc.RequestInfo) {
+		if ri != nil {
+			claims, _, _ := webRequestAuthenticate(ri.Request)
+			bucketName, objectName := extractBucketObject(ri.Args)
+			ri.Request = mux.SetURLVars(ri.Request, map[string]string{
+				"bucket": bucketName,
+				"object": objectName,
+			})
+			if globalTrace.NumSubscribers() > 0 {
+				globalTrace.Publish(WebTrace(ri))
+			}
+			ctx := newContext(ri.Request, ri.ResponseWriter, ri.Method)
+			logger.AuditLog(ctx, ri.ResponseWriter, ri.Request, claims.Map())
+		}
+	})
 
 	// Register RPC handlers with server
-	if err := webRPC.RegisterService(web, "Web"); err != nil {
+	if err := webRPC.RegisterService(web, "web"); err != nil {
 		return err
 	}
 
@@ -92,7 +100,11 @@ func registerWebRouter(router *mux.Router) error {
 	webBrowserRouter.Methods(http.MethodPost).Path("/zip").Queries("token", "{token:.*}").HandlerFunc(httpTraceHdrs(web.DownloadZip))
 
 	// Create compressed assets handler
-	compressAssets := handlers.CompressHandler(http.StripPrefix(minioReservedBucketPath, http.FileServer(assetFS())))
+	assetFS, err := fs.Sub(browser.GetStaticAssets(), assetPrefix)
+	if err != nil {
+		panic(err)
+	}
+	compressAssets := handlers.CompressHandler(http.StripPrefix(minioReservedBucketPath, http.FileServer(http.FS(assetFS))))
 
 	// Serve javascript files and favicon from assets.
 	webBrowserRouter.Path(fmt.Sprintf("/{assets:%s}", specialAssets)).Handler(compressAssets)

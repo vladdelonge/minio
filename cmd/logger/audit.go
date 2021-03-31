@@ -18,14 +18,13 @@ package logger
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"strconv"
 	"time"
 
-	"github.com/gorilla/mux"
 	"github.com/minio/minio/cmd/logger/message/audit"
 )
 
@@ -50,7 +49,7 @@ type ResponseWriter struct {
 }
 
 // NewResponseWriter - returns a wrapped response writer to trap
-// http status codes for auditiing purposes.
+// http status codes for auditing purposes.
 func NewResponseWriter(w http.ResponseWriter) *ResponseWriter {
 	return &ResponseWriter{
 		ResponseWriter: w,
@@ -60,16 +59,15 @@ func NewResponseWriter(w http.ResponseWriter) *ResponseWriter {
 }
 
 func (lrw *ResponseWriter) Write(p []byte) (int, error) {
+	if !lrw.headersLogged {
+		// We assume the response code to be '200 OK' when WriteHeader() is not called,
+		// that way following Golang HTTP response behavior.
+		lrw.WriteHeader(http.StatusOK)
+	}
 	n, err := lrw.ResponseWriter.Write(p)
 	lrw.bytesWritten += n
 	if lrw.TimeToFirstByte == 0 {
 		lrw.TimeToFirstByte = time.Now().UTC().Sub(lrw.StartTime)
-	}
-	if !lrw.headersLogged {
-		// We assume the response code to be '200 OK' when WriteHeader() is not called,
-		// that way following Golang HTTP response behavior.
-		lrw.writeHeaders(&lrw.headers, http.StatusOK, lrw.Header())
-		lrw.headersLogged = true
 	}
 	if (lrw.LogErrBody && lrw.StatusCode >= http.StatusBadRequest) || lrw.LogAllBody {
 		// Always logging error responses.
@@ -107,12 +105,12 @@ func (lrw *ResponseWriter) Body() []byte {
 
 // WriteHeader - writes http status code
 func (lrw *ResponseWriter) WriteHeader(code int) {
-	lrw.StatusCode = code
 	if !lrw.headersLogged {
+		lrw.StatusCode = code
 		lrw.writeHeaders(&lrw.headers, code, lrw.ResponseWriter.Header())
 		lrw.headersLogged = true
+		lrw.ResponseWriter.WriteHeader(code)
 	}
-	lrw.ResponseWriter.WriteHeader(code)
 }
 
 // Flush - Calls the underlying Flush.
@@ -126,7 +124,7 @@ func (lrw *ResponseWriter) Size() int {
 }
 
 // AuditLog - logs audit logs to all audit targets.
-func AuditLog(w http.ResponseWriter, r *http.Request, api string, reqClaims map[string]interface{}, filterKeys ...string) {
+func AuditLog(ctx context.Context, w http.ResponseWriter, r *http.Request, reqClaims map[string]interface{}, filterKeys ...string) {
 	// Fast exit if there is not audit target configured
 	if len(AuditTargets) == 0 {
 		return
@@ -145,11 +143,9 @@ func AuditLog(w http.ResponseWriter, r *http.Request, api string, reqClaims map[
 		timeToFirstByte = st.TimeToFirstByte
 	}
 
-	vars := mux.Vars(r)
-	bucket := vars["bucket"]
-	object, err := url.PathUnescape(vars["object"])
-	if err != nil {
-		object = vars["object"]
+	reqInfo := GetReqInfo(ctx)
+	if reqInfo == nil {
+		return
 	}
 
 	entry := audit.ToEntry(w, r, reqClaims, globalDeploymentID)
@@ -159,12 +155,13 @@ func AuditLog(w http.ResponseWriter, r *http.Request, api string, reqClaims map[
 		delete(entry.ReqHeader, filterKey)
 		delete(entry.RespHeader, filterKey)
 	}
-	entry.API.Name = api
-	entry.API.Bucket = bucket
-	entry.API.Object = object
+	entry.API.Name = reqInfo.API
+	entry.API.Bucket = reqInfo.BucketName
+	entry.API.Object = reqInfo.ObjectName
 	entry.API.Status = http.StatusText(statusCode)
 	entry.API.StatusCode = statusCode
 	entry.API.TimeToResponse = strconv.FormatInt(timeToResponse.Nanoseconds(), 10) + "ns"
+	entry.Tags = reqInfo.GetTagsMap()
 	// ttfb will be recorded only for GET requests, Ignore such cases where ttfb will be empty.
 	if timeToFirstByte != 0 {
 		entry.API.TimeToFirstByte = strconv.FormatInt(timeToFirstByte.Nanoseconds(), 10) + "ns"

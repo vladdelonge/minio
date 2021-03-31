@@ -34,21 +34,33 @@ import (
 // GatewayUnsupported list of unsupported call stubs for gateway.
 type GatewayUnsupported struct{}
 
-// CrawlAndGetDataUsage - crawl is not implemented for gateway
-func (a GatewayUnsupported) CrawlAndGetDataUsage(ctx context.Context, bf *bloomFilter, updates chan<- DataUsageInfo) error {
+// BackendInfo returns the underlying backend information
+func (a GatewayUnsupported) BackendInfo() madmin.BackendInfo {
+	return madmin.BackendInfo{Type: madmin.Gateway}
+}
+
+// LocalStorageInfo returns the local disks information, mainly used
+// in prometheus - for gateway this just a no-op
+func (a GatewayUnsupported) LocalStorageInfo(ctx context.Context) (StorageInfo, []error) {
+	logger.CriticalIf(ctx, errors.New("not implemented"))
+	return StorageInfo{}, nil
+}
+
+// NSScanner - scanner is not implemented for gateway
+func (a GatewayUnsupported) NSScanner(ctx context.Context, bf *bloomFilter, updates chan<- DataUsageInfo) error {
 	logger.CriticalIf(ctx, errors.New("not implemented"))
 	return NotImplemented{}
 }
 
 // NewNSLock is a dummy stub for gateway.
-func (a GatewayUnsupported) NewNSLock(ctx context.Context, bucket string, objects ...string) RWLocker {
-	logger.CriticalIf(ctx, errors.New("not implemented"))
+func (a GatewayUnsupported) NewNSLock(bucket string, objects ...string) RWLocker {
+	logger.CriticalIf(context.Background(), errors.New("not implemented"))
 	return nil
 }
 
-// SetDriveCount no-op
-func (a GatewayUnsupported) SetDriveCount() int {
-	return 0
+// SetDriveCounts no-op
+func (a GatewayUnsupported) SetDriveCounts() []int {
+	return nil
 }
 
 // ListMultipartUploads lists all multipart uploads.
@@ -160,24 +172,14 @@ func (a GatewayUnsupported) DeleteBucketSSEConfig(ctx context.Context, bucket st
 	return NotImplemented{}
 }
 
-// ReloadFormat - Not implemented stub.
-func (a GatewayUnsupported) ReloadFormat(ctx context.Context, dryRun bool) error {
-	return NotImplemented{}
-}
-
 // HealFormat - Not implemented stub
 func (a GatewayUnsupported) HealFormat(ctx context.Context, dryRun bool) (madmin.HealResultItem, error) {
 	return madmin.HealResultItem{}, NotImplemented{}
 }
 
 // HealBucket - Not implemented stub
-func (a GatewayUnsupported) HealBucket(ctx context.Context, bucket string, dryRun, remove bool) (madmin.HealResultItem, error) {
+func (a GatewayUnsupported) HealBucket(ctx context.Context, bucket string, opts madmin.HealOpts) (madmin.HealResultItem, error) {
 	return madmin.HealResultItem{}, NotImplemented{}
-}
-
-// ListBucketsHeal - Not implemented stub
-func (a GatewayUnsupported) ListBucketsHeal(ctx context.Context) (buckets []BucketInfo, err error) {
-	return nil, NotImplemented{}
 }
 
 // HealObject - Not implemented stub
@@ -207,15 +209,15 @@ func (a GatewayUnsupported) CopyObject(ctx context.Context, srcBucket string, sr
 }
 
 // GetMetrics - no op
-func (a GatewayUnsupported) GetMetrics(ctx context.Context) (*Metrics, error) {
+func (a GatewayUnsupported) GetMetrics(ctx context.Context) (*BackendMetrics, error) {
 	logger.LogIf(ctx, NotImplemented{})
-	return &Metrics{}, NotImplemented{}
+	return &BackendMetrics{}, NotImplemented{}
 }
 
 // PutObjectTags - not implemented.
-func (a GatewayUnsupported) PutObjectTags(ctx context.Context, bucket, object string, tags string, opts ObjectOptions) error {
+func (a GatewayUnsupported) PutObjectTags(ctx context.Context, bucket, object string, tags string, opts ObjectOptions) (ObjectInfo, error) {
 	logger.LogIf(ctx, NotImplemented{})
-	return NotImplemented{}
+	return ObjectInfo{}, NotImplemented{}
 }
 
 // GetObjectTags - not implemented.
@@ -225,9 +227,9 @@ func (a GatewayUnsupported) GetObjectTags(ctx context.Context, bucket, object st
 }
 
 // DeleteObjectTags - not implemented.
-func (a GatewayUnsupported) DeleteObjectTags(ctx context.Context, bucket, object string, opts ObjectOptions) error {
+func (a GatewayUnsupported) DeleteObjectTags(ctx context.Context, bucket, object string, opts ObjectOptions) (ObjectInfo, error) {
 	logger.LogIf(ctx, NotImplemented{})
-	return NotImplemented{}
+	return ObjectInfo{}, NotImplemented{}
 }
 
 // IsNotificationSupported returns whether bucket notification is applicable for this layer.
@@ -258,4 +260,9 @@ func (a GatewayUnsupported) IsCompressionSupported() bool {
 // Health - No Op.
 func (a GatewayUnsupported) Health(_ context.Context, _ HealthOptions) HealthResult {
 	return HealthResult{}
+}
+
+// ReadHealth - No Op.
+func (a GatewayUnsupported) ReadHealth(_ context.Context) bool {
+	return true
 }

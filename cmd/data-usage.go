@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"net/http"
 
 	jsoniter "github.com/json-iterator/go"
 	"github.com/minio/minio/cmd/logger"
@@ -27,9 +28,7 @@ import (
 )
 
 const (
-	envDataUsageCrawlConf  = "MINIO_DISK_USAGE_CRAWL_ENABLE"
-	envDataUsageCrawlDelay = "MINIO_DISK_USAGE_CRAWL_DELAY"
-	envDataUsageCrawlDebug = "MINIO_DISK_USAGE_CRAWL_DEBUG"
+	envDataUsageScannerDebug = "MINIO_DISK_USAGE_SCANNER_DEBUG"
 
 	dataUsageRoot   = SlashSeparator
 	dataUsageBucket = minioMetaBucket + SlashSeparator + bucketMetaPrefix
@@ -40,21 +39,20 @@ const (
 )
 
 // storeDataUsageInBackend will store all objects sent on the gui channel until closed.
-func storeDataUsageInBackend(ctx context.Context, objAPI ObjectLayer, gui <-chan DataUsageInfo) {
-	for dataUsageInfo := range gui {
+func storeDataUsageInBackend(ctx context.Context, objAPI ObjectLayer, dui <-chan DataUsageInfo) {
+	for dataUsageInfo := range dui {
 		dataUsageJSON, err := json.Marshal(dataUsageInfo)
 		if err != nil {
 			logger.LogIf(ctx, err)
 			continue
 		}
 		size := int64(len(dataUsageJSON))
-		r, err := hash.NewReader(bytes.NewReader(dataUsageJSON), size, "", "", size, false)
+		r, err := hash.NewReader(bytes.NewReader(dataUsageJSON), size, "", "", size)
 		if err != nil {
 			logger.LogIf(ctx, err)
 			continue
 		}
-
-		_, err = objAPI.PutObject(ctx, dataUsageBucket, dataUsageObjName, NewPutObjReader(r, nil, nil), ObjectOptions{})
+		_, err = objAPI.PutObject(ctx, dataUsageBucket, dataUsageObjName, NewPutObjReader(r), ObjectOptions{})
 		if !isErrBucketNotFound(err) {
 			logger.LogIf(ctx, err)
 		}
@@ -62,20 +60,18 @@ func storeDataUsageInBackend(ctx context.Context, objAPI ObjectLayer, gui <-chan
 }
 
 func loadDataUsageFromBackend(ctx context.Context, objAPI ObjectLayer) (DataUsageInfo, error) {
-	var dataUsageInfoJSON bytes.Buffer
-
-	err := objAPI.GetObject(ctx, dataUsageBucket, dataUsageObjName, 0, -1, &dataUsageInfoJSON, "", ObjectOptions{})
+	r, err := objAPI.GetObjectNInfo(ctx, dataUsageBucket, dataUsageObjName, nil, http.Header{}, readLock, ObjectOptions{})
 	if err != nil {
 		if isErrObjectNotFound(err) || isErrBucketNotFound(err) {
 			return DataUsageInfo{}, nil
 		}
 		return DataUsageInfo{}, toObjectErr(err, dataUsageBucket, dataUsageObjName)
 	}
+	defer r.Close()
 
 	var dataUsageInfo DataUsageInfo
 	var json = jsoniter.ConfigCompatibleWithStandardLibrary
-	err = json.Unmarshal(dataUsageInfoJSON.Bytes(), &dataUsageInfo)
-	if err != nil {
+	if err = json.NewDecoder(r).Decode(&dataUsageInfo); err != nil {
 		return DataUsageInfo{}, err
 	}
 

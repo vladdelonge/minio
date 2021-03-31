@@ -35,17 +35,23 @@ import (
 
 const (
 	// RFC3339 a subset of the ISO8601 timestamp format. e.g 2014-04-29T18:30:38Z
-	iso8601TimeFormat = "2006-01-02T15:04:05.000Z" // Reply date format with nanosecond precision.
-	maxObjectList     = 1000                       // Limit number of objects in a listObjectsResponse/listObjectsVersionsResponse.
-	maxDeleteList     = 10000                      // Limit number of objects deleted in a delete call.
-	maxUploadsList    = 10000                      // Limit number of uploads in a listUploadsResponse.
-	maxPartsList      = 10000                      // Limit number of parts in a listPartsResponse.
+	iso8601TimeFormat = "2006-01-02T15:04:05.000Z"                     // Reply date format with nanosecond precision.
+	maxObjectList     = metacacheBlockSize - (metacacheBlockSize / 10) // Limit number of objects in a listObjectsResponse/listObjectsVersionsResponse.
+	maxDeleteList     = 10000                                          // Limit number of objects deleted in a delete call.
+	maxUploadsList    = 10000                                          // Limit number of uploads in a listUploadsResponse.
+	maxPartsList      = 10000                                          // Limit number of parts in a listPartsResponse.
 )
 
 // LocationResponse - format for location response.
 type LocationResponse struct {
 	XMLName  xml.Name `xml:"http://s3.amazonaws.com/doc/2006-03-01/ LocationConstraint" json:"-"`
 	Location string   `xml:",chardata"`
+}
+
+// PolicyStatus captures information returned by GetBucketPolicyStatusHandler
+type PolicyStatus struct {
+	XMLName  xml.Name `xml:"http://s3.amazonaws.com/doc/2006-03-01/ PolicyStatus" json:"-"`
+	IsPublic string
 }
 
 // ListVersionsResponse - format for list bucket versions response.
@@ -388,7 +394,7 @@ func getObjectLocation(r *http.Request, domains []string, bucket, object string)
 	}
 	proto := handlers.GetSourceScheme(r)
 	if proto == "" {
-		proto = getURLScheme(globalIsSSL)
+		proto = getURLScheme(globalIsTLS)
 	}
 	u := &url.URL{
 		Host:   r.Host,
@@ -410,9 +416,11 @@ func getObjectLocation(r *http.Request, domains []string, bucket, object string)
 func generateListBucketsResponse(buckets []BucketInfo) ListBucketsResponse {
 	listbuckets := make([]Bucket, 0, len(buckets))
 	var data = ListBucketsResponse{}
-	var owner = Owner{}
+	var owner = Owner{
+		ID:          globalMinioDefaultOwnerID,
+		DisplayName: "minio",
+	}
 
-	owner.ID = globalMinioDefaultOwnerID
 	for _, bucket := range buckets {
 		var listbucket = Bucket{}
 		listbucket.Name = bucket.Name
@@ -429,10 +437,12 @@ func generateListBucketsResponse(buckets []BucketInfo) ListBucketsResponse {
 // generates an ListBucketVersions response for the said bucket with other enumerated options.
 func generateListVersionsResponse(bucket, prefix, marker, versionIDMarker, delimiter, encodingType string, maxKeys int, resp ListObjectVersionsInfo) ListVersionsResponse {
 	versions := make([]ObjectVersion, 0, len(resp.Objects))
-	var owner = Owner{}
+	var owner = Owner{
+		ID:          globalMinioDefaultOwnerID,
+		DisplayName: "minio",
+	}
 	var data = ListVersionsResponse{}
 
-	owner.ID = globalMinioDefaultOwnerID
 	for _, object := range resp.Objects {
 		var content = ObjectVersion{}
 		if object.Name == "" {
@@ -485,10 +495,12 @@ func generateListVersionsResponse(bucket, prefix, marker, versionIDMarker, delim
 // generates an ListObjectsV1 response for the said bucket with other enumerated options.
 func generateListObjectsV1Response(bucket, prefix, marker, delimiter, encodingType string, maxKeys int, resp ListObjectsInfo) ListObjectsResponse {
 	contents := make([]Object, 0, len(resp.Objects))
-	var owner = Owner{}
+	var owner = Owner{
+		ID:          globalMinioDefaultOwnerID,
+		DisplayName: "minio",
+	}
 	var data = ListObjectsResponse{}
 
-	owner.ID = globalMinioDefaultOwnerID
 	for _, object := range resp.Objects {
 		var content = Object{}
 		if object.Name == "" {
@@ -532,12 +544,11 @@ func generateListObjectsV1Response(bucket, prefix, marker, delimiter, encodingTy
 // generates an ListObjectsV2 response for the said bucket with other enumerated options.
 func generateListObjectsV2Response(bucket, prefix, token, nextToken, startAfter, delimiter, encodingType string, fetchOwner, isTruncated bool, maxKeys int, objects []ObjectInfo, prefixes []string, metadata bool) ListObjectsV2Response {
 	contents := make([]Object, 0, len(objects))
-	var owner = Owner{}
-	var data = ListObjectsV2Response{}
-
-	if fetchOwner {
-		owner.ID = globalMinioDefaultOwnerID
+	var owner = Owner{
+		ID:          globalMinioDefaultOwnerID,
+		DisplayName: "minio",
 	}
+	var data = ListObjectsV2Response{}
 
 	for _, object := range objects {
 		var content = Object{}
@@ -565,7 +576,7 @@ func generateListObjectsV2Response(bucket, prefix, token, nextToken, startAfter,
 					continue
 				}
 				// https://github.com/google/security-research/security/advisories/GHSA-76wf-9vgp-pj7w
-				if strings.EqualFold(k, xhttp.AmzMetaUnencryptedContentLength) || strings.EqualFold(k, xhttp.AmzMetaUnencryptedContentMD5) {
+				if equals(k, xhttp.AmzMetaUnencryptedContentLength, xhttp.AmzMetaUnencryptedContentMD5) {
 					continue
 				}
 				content.UserMetadata[k] = v
@@ -639,8 +650,16 @@ func generateListPartsResponse(partsInfo ListPartsInfo, encodingType string) Lis
 	listPartsResponse.Key = s3EncodeName(partsInfo.Object, encodingType)
 	listPartsResponse.UploadID = partsInfo.UploadID
 	listPartsResponse.StorageClass = globalMinioDefaultStorageClass
-	listPartsResponse.Initiator.ID = globalMinioDefaultOwnerID
-	listPartsResponse.Owner.ID = globalMinioDefaultOwnerID
+
+	// Dumb values not meaningful
+	listPartsResponse.Initiator = Initiator{
+		ID:          globalMinioDefaultOwnerID,
+		DisplayName: globalMinioDefaultOwnerID,
+	}
+	listPartsResponse.Owner = Owner{
+		ID:          globalMinioDefaultOwnerID,
+		DisplayName: globalMinioDefaultOwnerID,
+	}
 
 	listPartsResponse.MaxParts = partsInfo.MaxParts
 	listPartsResponse.PartNumberMarker = partsInfo.PartNumberMarker
@@ -703,10 +722,6 @@ func generateMultiDeleteResponse(quiet bool, deletedObjects []DeletedObject, err
 }
 
 func writeResponse(w http.ResponseWriter, statusCode int, response []byte, mType mimeType) {
-	if newObjectLayerFn() == nil {
-		// Server still in safe mode.
-		w.Header().Set(xhttp.MinIOServerStatus, "safemode")
-	}
 	setCommonHeaders(w)
 	if mType != mimeNone {
 		w.Header().Set(xhttp.ContentType, string(mType))
@@ -773,10 +788,6 @@ func writeErrorResponse(ctx context.Context, w http.ResponseWriter, err APIError
 		// The request is from browser and also if browser
 		// is enabled we need to redirect.
 		if browser && globalBrowserEnabled {
-			if newObjectLayerFn() == nil {
-				// server still in safe mode.
-				w.Header().Set(xhttp.MinIOServerStatus, "safemode")
-			}
 			w.Header().Set(xhttp.Location, minioReservedBucketPath+reqURL.Path)
 			w.WriteHeader(http.StatusTemporaryRedirect)
 			return

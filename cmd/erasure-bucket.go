@@ -18,6 +18,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 
 	"github.com/minio/minio-go/v7/pkg/s3utils"
 	"github.com/minio/minio/cmd/logger"
@@ -49,7 +50,7 @@ func (er erasureObjects) MakeBucketWithLocation(ctx context.Context, bucket stri
 		g.Go(func() error {
 			if storageDisks[index] != nil {
 				if err := storageDisks[index].MakeVol(ctx, bucket); err != nil {
-					if err != errVolumeExists {
+					if !errors.Is(err, errVolumeExists) {
 						logger.LogIf(ctx, err)
 					}
 					return err
@@ -143,12 +144,12 @@ func deleteDanglingBucket(ctx context.Context, storageDisks []StorageAPI, dErrs 
 		if err == errVolumeNotEmpty {
 			// Attempt to delete bucket again.
 			if derr := storageDisks[index].DeleteVol(ctx, bucket, false); derr == errVolumeNotEmpty {
-				_ = cleanupDir(ctx, storageDisks[index], bucket, "")
+				_ = storageDisks[index].Delete(ctx, bucket, "", true)
 
 				_ = storageDisks[index].DeleteVol(ctx, bucket, false)
 
 				// Cleanup all the previously incomplete multiparts.
-				_ = cleanupDir(ctx, storageDisks[index], minioMetaMultipartBucket, bucket)
+				_ = storageDisks[index].Delete(ctx, minioMetaMultipartBucket, bucket, true)
 			}
 		}
 	}
@@ -157,6 +158,7 @@ func deleteDanglingBucket(ctx context.Context, storageDisks []StorageAPI, dErrs 
 // DeleteBucket - deletes a bucket.
 func (er erasureObjects) DeleteBucket(ctx context.Context, bucket string, forceDelete bool) error {
 	// Collect if all disks report volume not found.
+	defer ObjectPathUpdated(bucket + slashSeparator)
 	storageDisks := er.getDisks()
 
 	g := errgroup.WithNErrs(len(storageDisks))
@@ -168,8 +170,7 @@ func (er erasureObjects) DeleteBucket(ctx context.Context, bucket string, forceD
 				if err := storageDisks[index].DeleteVol(ctx, bucket, forceDelete); err != nil {
 					return err
 				}
-				err := cleanupDir(ctx, storageDisks[index], minioMetaMultipartBucket, bucket)
-				if err != nil && err != errVolumeNotFound {
+				if err := storageDisks[index].Delete(ctx, minioMetaMultipartBucket, bucket, true); err != errFileNotFound {
 					return err
 				}
 				return nil

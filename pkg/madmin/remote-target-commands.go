@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/minio/minio/pkg/auth"
 )
@@ -35,11 +36,13 @@ type ServiceType string
 const (
 	// ReplicationService specifies replication service
 	ReplicationService ServiceType = "replication"
+	// ILMService specifies ilm service
+	ILMService ServiceType = "ilm"
 )
 
-// IsValid returns true if ARN type represents replication
+// IsValid returns true if ARN type represents replication or ilm
 func (t ServiceType) IsValid() bool {
-	return t == ReplicationService
+	return t == ReplicationService || t == ILMService
 }
 
 // ARN is a struct to define arn.
@@ -84,49 +87,52 @@ func ParseARN(s string) (*ARN, error) {
 
 // BucketTarget represents the target bucket and site association.
 type BucketTarget struct {
-	SourceBucket string            `json:"sourcebucket"`
-	Endpoint     string            `json:"endpoint"`
-	Credentials  *auth.Credentials `json:"credentials"`
-	TargetBucket string            `json:"targetbucket"`
-	Secure       bool              `json:"secure"`
-	Path         string            `json:"path,omitempty"`
-	API          string            `json:"api,omitempty"`
-	Arn          string            `json:"arn,omitempty"`
-	Type         ServiceType       `json:"type"`
-	Region       string            `json:"omitempty"`
+	SourceBucket        string            `json:"sourcebucket"`
+	Endpoint            string            `json:"endpoint"`
+	Credentials         *auth.Credentials `json:"credentials"`
+	TargetBucket        string            `json:"targetbucket"`
+	Secure              bool              `json:"secure"`
+	Path                string            `json:"path,omitempty"`
+	API                 string            `json:"api,omitempty"`
+	Arn                 string            `json:"arn,omitempty"`
+	Type                ServiceType       `json:"type"`
+	Region              string            `json:"omitempty"`
+	Label               string            `json:"label,omitempty"`
+	BandwidthLimit      int64             `json:"bandwidthlimit,omitempty"`
+	ReplicationSync     bool              `json:"replicationSync"`
+	HealthCheckDuration time.Duration     `json:"healthCheckDuration,omitempty"`
 }
 
 // Clone returns shallow clone of BucketTarget without secret key in credentials
 func (t *BucketTarget) Clone() BucketTarget {
 	return BucketTarget{
-		SourceBucket: t.SourceBucket,
-		Endpoint:     t.Endpoint,
-		TargetBucket: t.TargetBucket,
-		Credentials:  &auth.Credentials{AccessKey: t.Credentials.AccessKey},
-		Secure:       t.Secure,
-		Path:         t.Path,
-		API:          t.Path,
-		Arn:          t.Arn,
-		Type:         t.Type,
-		Region:       t.Region,
+		SourceBucket:        t.SourceBucket,
+		Endpoint:            t.Endpoint,
+		TargetBucket:        t.TargetBucket,
+		Credentials:         &auth.Credentials{AccessKey: t.Credentials.AccessKey},
+		Secure:              t.Secure,
+		Path:                t.Path,
+		API:                 t.Path,
+		Arn:                 t.Arn,
+		Type:                t.Type,
+		Region:              t.Region,
+		Label:               t.Label,
+		BandwidthLimit:      t.BandwidthLimit,
+		ReplicationSync:     t.ReplicationSync,
+		HealthCheckDuration: t.HealthCheckDuration,
 	}
 }
 
 // URL returns target url
-func (t BucketTarget) URL() string {
+func (t BucketTarget) URL() *url.URL {
 	scheme := "http"
 	if t.Secure {
 		scheme = "https"
 	}
-	urlStr := fmt.Sprintf("%s://%s", scheme, t.Endpoint)
-	u, err := url.Parse(urlStr)
-	if err != nil {
-		return urlStr
+	return &url.URL{
+		Scheme: scheme,
+		Host:   t.Endpoint,
 	}
-	if u.Port() == "80" || u.Port() == "443" {
-		u.Host = u.Hostname()
-	}
-	return u.String()
 }
 
 // Empty returns true if struct is empty.
@@ -202,6 +208,51 @@ func (adm *AdminClient) SetRemoteTarget(ctx context.Context, bucket string, targ
 	}
 	queryValues := url.Values{}
 	queryValues.Set("bucket", bucket)
+
+	reqData := requestData{
+		relPath:     adminAPIPrefix + "/set-remote-target",
+		queryValues: queryValues,
+		content:     encData,
+	}
+
+	// Execute PUT on /minio/admin/v3/set-remote-target to set a target for this bucket of specific arn type.
+	resp, err := adm.executeMethod(ctx, http.MethodPut, reqData)
+
+	defer closeResponse(resp)
+	if err != nil {
+		return "", err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return "", httpRespToErrorResponse(resp)
+	}
+	b, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	var arn string
+	if err = json.Unmarshal(b, &arn); err != nil {
+		return "", err
+	}
+	return arn, nil
+}
+
+// UpdateRemoteTarget updates credentials for a remote bucket target
+func (adm *AdminClient) UpdateRemoteTarget(ctx context.Context, target *BucketTarget) (string, error) {
+	if target == nil {
+		return "", fmt.Errorf("target cannot be nil")
+	}
+	data, err := json.Marshal(target)
+	if err != nil {
+		return "", err
+	}
+	encData, err := EncryptData(adm.getSecretKey(), data)
+	if err != nil {
+		return "", err
+	}
+	queryValues := url.Values{}
+	queryValues.Set("bucket", target.SourceBucket)
+	queryValues.Set("update", "true")
 
 	reqData := requestData{
 		relPath:     adminAPIPrefix + "/set-remote-target",

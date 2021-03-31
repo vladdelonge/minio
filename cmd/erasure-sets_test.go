@@ -173,23 +173,23 @@ func TestNewErasureSets(t *testing.T) {
 	}
 
 	endpoints := mustGetNewEndpoints(erasureDisks...)
-	_, _, err := waitForFormatErasure(true, endpoints, 1, 0, 16, "")
+	_, _, err := waitForFormatErasure(true, endpoints, 1, 0, 16, "", "")
 	if err != errInvalidArgument {
 		t.Fatalf("Expecting error, got %s", err)
 	}
 
-	_, _, err = waitForFormatErasure(true, nil, 1, 1, 16, "")
+	_, _, err = waitForFormatErasure(true, nil, 1, 1, 16, "", "")
 	if err != errInvalidArgument {
 		t.Fatalf("Expecting error, got %s", err)
 	}
 
 	// Initializes all erasure disks
-	storageDisks, format, err := waitForFormatErasure(true, endpoints, 1, 1, 16, "")
+	storageDisks, format, err := waitForFormatErasure(true, endpoints, 1, 1, 16, "", "")
 	if err != nil {
 		t.Fatalf("Unable to format disks for erasure, %s", err)
 	}
 
-	if _, err := newErasureSets(ctx, endpoints, storageDisks, format); err != nil {
+	if _, err := newErasureSets(ctx, endpoints, storageDisks, format, ecDrivesNoConfig(16), 0); err != nil {
 		t.Fatalf("Unable to initialize erasure")
 	}
 }
@@ -197,27 +197,13 @@ func TestNewErasureSets(t *testing.T) {
 // TestHashedLayer - tests the hashed layer which will be returned
 // consistently for a given object name.
 func TestHashedLayer(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	var objs []*erasureObjects
-	for i := 0; i < 16; i++ {
-		obj, fsDirs, err := prepareErasure16(ctx)
-		if err != nil {
-			t.Fatal("Unable to initialize 'Erasure' object layer.", err)
-		}
-		defer obj.Shutdown(ctx)
-
-		// Remove all dirs.
-		for _, dir := range fsDirs {
-			defer os.RemoveAll(dir)
-		}
-
-		z := obj.(*erasureZones)
-		objs = append(objs, z.zones[0].sets[0])
+	// Test distribution with 16 sets.
+	var objs [16]*erasureObjects
+	for i := range objs {
+		objs[i] = &erasureObjects{}
 	}
 
-	sets := &erasureSets{sets: objs, distributionAlgo: "CRCMOD"}
+	sets := &erasureSets{sets: objs[:], distributionAlgo: "CRCMOD"}
 
 	testCases := []struct {
 		objectName  string

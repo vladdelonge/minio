@@ -32,37 +32,18 @@ type BackendType int
 
 // Enum for different backend types.
 const (
-	Unknown BackendType = iota
+	Unknown = BackendType(madmin.Unknown)
 	// Filesystem backend.
-	BackendFS
+	BackendFS = BackendType(madmin.FS)
 	// Multi disk BackendErasure (single, distributed) backend.
-	BackendErasure
+	BackendErasure = BackendType(madmin.Erasure)
 	// Gateway backend.
-	BackendGateway
+	BackendGateway = BackendType(madmin.Gateway)
 	// Add your own backend.
 )
 
 // StorageInfo - represents total capacity of underlying storage.
-type StorageInfo struct {
-	Disks []madmin.Disk
-
-	// Backend type.
-	Backend struct {
-		// Represents various backend types, currently on FS, Erasure and Gateway
-		Type BackendType
-
-		// Following fields are only meaningful if BackendType is Gateway.
-		GatewayOnline bool
-
-		// Following fields are only meaningful if BackendType is Erasure.
-		OnlineDisks      madmin.BackendDisks // Online disks during server startup.
-		OfflineDisks     madmin.BackendDisks // Offline disks during server startup.
-		StandardSCData   int                 // Data disks for currently configured Standard storage class.
-		StandardSCParity int                 // Parity disks for currently configured Standard storage class.
-		RRSCData         int                 // Data disks for currently configured Reduced Redundancy storage class.
-		RRSCParity       int                 // Parity disks for currently configured Reduced Redundancy storage class.
-	}
-}
+type StorageInfo = madmin.StorageInfo
 
 // objectHistogramInterval is an interval that will be
 // used to report the histogram of objects data sizes
@@ -93,9 +74,13 @@ var ObjectsHistogramIntervals = []objectHistogramInterval{
 // - total objects in a bucket
 // - object size histogram per bucket
 type BucketUsageInfo struct {
-	Size                 uint64            `json:"size"`
-	ObjectsCount         uint64            `json:"objectsCount"`
-	ObjectSizesHistogram map[string]uint64 `json:"objectsSizesHistogram"`
+	Size                   uint64            `json:"size"`
+	ReplicationPendingSize uint64            `json:"objectsPendingReplicationTotalSize"`
+	ReplicationFailedSize  uint64            `json:"objectsFailedReplicationTotalSize"`
+	ReplicatedSize         uint64            `json:"objectsReplicatedTotalSize"`
+	ReplicaSize            uint64            `json:"objectReplicaTotalSize"`
+	ObjectsCount           uint64            `json:"objectsCount"`
+	ObjectSizesHistogram   map[string]uint64 `json:"objectsSizesHistogram"`
 }
 
 // DataUsageInfo represents data usage stats of the underlying Object API
@@ -109,6 +94,18 @@ type DataUsageInfo struct {
 
 	// Objects total size across all buckets
 	ObjectsTotalSize uint64 `json:"objectsTotalSize"`
+
+	// Total Size for objects that have not yet been replicated
+	ReplicationPendingSize uint64 `json:"objectsPendingReplicationTotalSize"`
+
+	// Total size for objects that have witness one or more failures and will be retried
+	ReplicationFailedSize uint64 `json:"objectsFailedReplicationTotalSize"`
+
+	// Total size for objects that have been replicated to destination
+	ReplicatedSize uint64 `json:"objectsReplicatedTotalSize"`
+
+	// Total size for objects that are replicas
+	ReplicaSize uint64 `json:"objectsReplicaTotalSize"`
 
 	// Total number of buckets in this cluster
 	BucketsCount uint64 `json:"bucketsCount"`
@@ -152,6 +149,9 @@ type ObjectInfo struct {
 	// Hex encoded unique entity tag of the object.
 	ETag string
 
+	// The ETag stored in the gateway backend
+	InnerETag string
+
 	// Version ID of this object.
 	VersionID string
 
@@ -162,6 +162,15 @@ type ObjectInfo struct {
 	// DeleteMarker indicates if the versionId corresponds
 	// to a delete marker on an object.
 	DeleteMarker bool
+
+	// TransitionStatus indicates if transition is complete/pending
+	TransitionStatus string
+
+	// RestoreExpires indicates date a restored object expires
+	RestoreExpires time.Time
+
+	// RestoreOngoing indicates if a restore is in progress
+	RestoreOngoing bool
 
 	// A standard MIME type describing the format of the object.
 	ContentType string
@@ -208,6 +217,58 @@ type ObjectInfo struct {
 
 	// backendType indicates which backend filled this structure
 	backendType BackendType
+
+	VersionPurgeStatus VersionPurgeStatusType
+
+	// The total count of all versions of this object
+	NumVersions int
+	//  The modtime of the successor object version if any
+	SuccessorModTime time.Time
+}
+
+// Clone - Returns a cloned copy of current objectInfo
+func (o ObjectInfo) Clone() (cinfo ObjectInfo) {
+	cinfo = ObjectInfo{
+		Bucket:             o.Bucket,
+		Name:               o.Name,
+		ModTime:            o.ModTime,
+		Size:               o.Size,
+		IsDir:              o.IsDir,
+		ETag:               o.ETag,
+		InnerETag:          o.InnerETag,
+		VersionID:          o.VersionID,
+		IsLatest:           o.IsLatest,
+		DeleteMarker:       o.DeleteMarker,
+		TransitionStatus:   o.TransitionStatus,
+		RestoreExpires:     o.RestoreExpires,
+		RestoreOngoing:     o.RestoreOngoing,
+		ContentType:        o.ContentType,
+		ContentEncoding:    o.ContentEncoding,
+		Expires:            o.Expires,
+		CacheStatus:        o.CacheStatus,
+		CacheLookupStatus:  o.CacheLookupStatus,
+		StorageClass:       o.StorageClass,
+		ReplicationStatus:  o.ReplicationStatus,
+		UserTags:           o.UserTags,
+		Parts:              o.Parts,
+		Writer:             o.Writer,
+		Reader:             o.Reader,
+		PutObjReader:       o.PutObjReader,
+		metadataOnly:       o.metadataOnly,
+		versionOnly:        o.versionOnly,
+		keyRotation:        o.keyRotation,
+		backendType:        o.backendType,
+		AccTime:            o.AccTime,
+		Legacy:             o.Legacy,
+		VersionPurgeStatus: o.VersionPurgeStatus,
+		NumVersions:        o.NumVersions,
+		SuccessorModTime:   o.SuccessorModTime,
+	}
+	cinfo.UserDefined = make(map[string]string, len(o.UserDefined))
+	for k, v := range o.UserDefined {
+		cinfo.UserDefined[k] = v
+	}
+	return cinfo
 }
 
 // MultipartInfo captures metadata information about the uploadId

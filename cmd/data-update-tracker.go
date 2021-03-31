@@ -34,19 +34,20 @@ import (
 	"github.com/minio/minio/cmd/config"
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/color"
+	"github.com/minio/minio/pkg/console"
 	"github.com/minio/minio/pkg/env"
 	"github.com/willf/bloom"
 )
 
 const (
 	// Estimate bloom filter size. With this many items
-	dataUpdateTrackerEstItems = 1000000
+	dataUpdateTrackerEstItems = 10000000
 	// ... we want this false positive rate:
 	dataUpdateTrackerFP        = 0.99
-	dataUpdateTrackerQueueSize = 10000
+	dataUpdateTrackerQueueSize = 0
 
 	dataUpdateTrackerFilename     = dataUsageBucket + SlashSeparator + ".tracker.bin"
-	dataUpdateTrackerVersion      = 2
+	dataUpdateTrackerVersion      = 4
 	dataUpdateTrackerSaveInterval = 5 * time.Minute
 )
 
@@ -79,7 +80,7 @@ func newDataUpdateTracker() *dataUpdateTracker {
 		Current: dataUpdateFilter{
 			idx: 1,
 		},
-		debug:      env.Get(envDataUsageCrawlDebug, config.EnableOff) == config.EnableOn,
+		debug:      env.Get(envDataUsageScannerDebug, config.EnableOff) == config.EnableOn || serverDebugLog,
 		input:      make(chan string, dataUpdateTrackerQueueSize),
 		save:       make(chan struct{}, 1),
 		saveExited: make(chan struct{}),
@@ -168,6 +169,44 @@ func (d *dataUpdateTracker) current() uint64 {
 	return d.Current.idx
 }
 
+// latestWithDir returns the highest index that contains the directory.
+// This means that any cycle higher than this does NOT contain the entry.
+func (d *dataUpdateTracker) latestWithDir(dir string) uint64 {
+	dateUpdateTrackerLogPrefix := color.Green("dataUpdateTracker:")
+	bucket, _ := path2BucketObjectWithBasePath("", dir)
+	if bucket == "" {
+		if d.debug && len(dir) > 0 {
+			console.Debugf(dateUpdateTrackerLogPrefix+" no bucket (%s)\n", dir)
+		}
+		return d.current()
+	}
+	if isReservedOrInvalidBucket(bucket, false) {
+		if d.debug {
+			console.Debugf(dateUpdateTrackerLogPrefix+" isReservedOrInvalidBucket: %v, entry: %v\n", bucket, dir)
+		}
+		return d.current()
+	}
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.Current.bf.containsDir(dir) || d.Current.idx == 0 {
+		return d.Current.idx
+	}
+	if d.debug {
+		console.Debugf(dateUpdateTrackerLogPrefix+" current bloom does NOT contains dir %s\n", dir)
+	}
+
+	idx := d.Current.idx - 1
+	for {
+		f := d.History.find(idx)
+		if f == nil || f.bf.containsDir(dir) || idx == 0 {
+			break
+		}
+		idx--
+	}
+	return idx
+}
+
 // start will load the current data from the drives start collecting information and
 // start a saver goroutine.
 // All of these will exit when the context is canceled.
@@ -198,7 +237,7 @@ func (d *dataUpdateTracker) load(ctx context.Context, drives ...string) {
 		cacheFormatPath := pathJoin(drive, dataUpdateTrackerFilename)
 		f, err := os.Open(cacheFormatPath)
 		if err != nil {
-			if os.IsNotExist(err) {
+			if osIsNotExist(err) {
 				continue
 			}
 			logger.LogIf(ctx, err)
@@ -244,7 +283,7 @@ func (d *dataUpdateTracker) startSaver(ctx context.Context, interval time.Durati
 		d.Saved = UTCNow()
 		err := d.serialize(&buf)
 		if d.debug {
-			logger.Info(color.Green("dataUpdateTracker:")+" Saving: %v bytes, Current idx: %v", buf.Len(), d.Current.idx)
+			console.Debugf(color.Green("dataUpdateTracker:")+" Saving: %v bytes, Current idx: %v\n", buf.Len(), d.Current.idx)
 		}
 		d.dirty = false
 		d.mu.Unlock()
@@ -263,7 +302,7 @@ func (d *dataUpdateTracker) startSaver(ctx context.Context, interval time.Durati
 			cacheFormatPath := pathJoin(drive, dataUpdateTrackerFilename)
 			err := ioutil.WriteFile(cacheFormatPath, buf.Bytes(), os.ModePerm)
 			if err != nil {
-				if os.IsNotExist(err) {
+				if osIsNotExist(err) {
 					continue
 				}
 				logger.LogIf(ctx, err)
@@ -366,8 +405,8 @@ func (d *dataUpdateTracker) deserialize(src io.Reader, newerThan time.Time) erro
 		return err
 	}
 	switch tmp[0] {
-	case 1:
-		logger.Info(color.Green("dataUpdateTracker: ") + "deprecated data version, updating.")
+	case 1, 2, 3:
+		console.Println(color.Green("dataUpdateTracker: ") + "deprecated data version, updating.")
 		return nil
 	case dataUpdateTrackerVersion:
 	default:
@@ -440,39 +479,65 @@ func (d *dataUpdateTracker) deserialize(src io.Reader, newerThan time.Time) erro
 // start a collector that picks up entries from objectUpdatedCh
 // and adds them  to the current bloom filter.
 func (d *dataUpdateTracker) startCollector(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case in := <-d.input:
-			bucket, _ := path2BucketObjectWithBasePath("", in)
-			if bucket == "" {
-				if d.debug && len(in) > 0 {
-					logger.Info(color.Green("data-usage:")+" no bucket (%s)", in)
-				}
-				continue
+	for in := range d.input {
+		bucket, _ := path2BucketObjectWithBasePath("", in)
+		if bucket == "" {
+			if d.debug && len(in) > 0 {
+				console.Debugf(color.Green("dataUpdateTracker:")+" no bucket (%s)\n", in)
 			}
-
-			if isReservedOrInvalidBucket(bucket, false) {
-				if false && d.debug {
-					logger.Info(color.Green("data-usage:")+" isReservedOrInvalidBucket: %v, entry: %v", bucket, in)
-				}
-				continue
-			}
-			split := splitPathDeterministic(in)
-
-			// Add all paths until level 3.
-			d.mu.Lock()
-			for i := range split {
-				if d.debug && false {
-					logger.Info(color.Green("dataUpdateTracker:") + " Marking path dirty: " + color.Blue(path.Join(split[:i+1]...)))
-				}
-				d.Current.bf.AddString(hashPath(path.Join(split[:i+1]...)).String())
-			}
-			d.dirty = d.dirty || len(split) > 0
-			d.mu.Unlock()
+			continue
 		}
+
+		if isReservedOrInvalidBucket(bucket, false) {
+			if d.debug {
+				console.Debugf(color.Green("dataUpdateTracker:")+" isReservedOrInvalidBucket: %v, entry: %v\n", bucket, in)
+			}
+			continue
+		}
+		split := splitPathDeterministic(in)
+
+		// Add all paths until done.
+		d.mu.Lock()
+		for i := range split {
+			if d.debug {
+				console.Debugln(color.Green("dataUpdateTracker:") + " Marking path dirty: " + color.Blue(path.Join(split[:i+1]...)))
+			}
+			d.Current.bf.AddString(hashPath(path.Join(split[:i+1]...)).String())
+		}
+		d.dirty = d.dirty || len(split) > 0
+		d.mu.Unlock()
 	}
+}
+
+// markDirty adds the supplied path to the current bloom filter.
+func (d *dataUpdateTracker) markDirty(in string) {
+	bucket, _ := path2BucketObjectWithBasePath("", in)
+	dateUpdateTrackerLogPrefix := color.Green("dataUpdateTracker:")
+	if bucket == "" {
+		if d.debug && len(in) > 0 {
+			console.Debugf(dateUpdateTrackerLogPrefix+" no bucket (%s)\n", in)
+		}
+		return
+	}
+
+	if isReservedOrInvalidBucket(bucket, false) {
+		if d.debug && false {
+			console.Debugf(dateUpdateTrackerLogPrefix+" isReservedOrInvalidBucket: %v, entry: %v\n", bucket, in)
+		}
+		return
+	}
+	split := splitPathDeterministic(in)
+
+	// Add all paths until done.
+	d.mu.Lock()
+	for i := range split {
+		if d.debug {
+			console.Debugln(dateUpdateTrackerLogPrefix + " Marking path dirty: " + color.Blue(path.Join(split[:i+1]...)))
+		}
+		d.Current.bf.AddString(hashPath(path.Join(split[:i+1]...)).String())
+	}
+	d.dirty = d.dirty || len(split) > 0
+	d.mu.Unlock()
 }
 
 // find entry with specified index.
@@ -534,8 +599,13 @@ func (d *dataUpdateTracker) filterFrom(ctx context.Context, oldest, newest uint6
 // cycleFilter will cycle the bloom filter to start recording to index y if not already.
 // The response will contain a bloom filter starting at index x up to, but not including index y.
 // If y is 0, the response will not update y, but return the currently recorded information
-// from the up until and including current y.
-func (d *dataUpdateTracker) cycleFilter(ctx context.Context, oldest, current uint64) (*bloomFilterResponse, error) {
+// from the oldest (unless 0, then it will be all) until and including current y.
+func (d *dataUpdateTracker) cycleFilter(ctx context.Context, req bloomFilterRequest) (*bloomFilterResponse, error) {
+	if req.OldestClean != "" {
+		return &bloomFilterResponse{OldestIdx: d.latestWithDir(req.OldestClean)}, nil
+	}
+	current := req.Current
+	oldest := req.Oldest
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if current == 0 {
@@ -543,14 +613,17 @@ func (d *dataUpdateTracker) cycleFilter(ctx context.Context, oldest, current uin
 			return d.filterFrom(ctx, d.Current.idx, d.Current.idx), nil
 		}
 		d.History.sort()
-		return d.filterFrom(ctx, d.History[len(d.History)-1].idx, d.Current.idx), nil
+		if oldest == 0 {
+			oldest = d.History[len(d.History)-1].idx
+		}
+		return d.filterFrom(ctx, oldest, d.Current.idx), nil
 	}
 
 	// Move current to history if new one requested
 	if d.Current.idx != current {
 		d.dirty = true
 		if d.debug {
-			logger.Info(color.Green("dataUpdateTracker:")+" cycle bloom filter: %v -> %v", d.Current.idx, current)
+			console.Debugf(color.Green("dataUpdateTracker:")+" cycle bloom filter: %v -> %v\n", d.Current.idx, current)
 		}
 
 		d.History = append(d.History, d.Current)
@@ -571,7 +644,7 @@ func (d *dataUpdateTracker) cycleFilter(ctx context.Context, oldest, current uin
 // Trailing slashes are removed.
 // Returns 0 length if no parts are found after trimming.
 func splitPathDeterministic(in string) []string {
-	split := strings.Split(in, SlashSeparator)
+	split := strings.Split(decodeDirObject(in), SlashSeparator)
 
 	// Trim empty start/end
 	for len(split) > 0 {
@@ -587,10 +660,6 @@ func splitPathDeterministic(in string) []string {
 		split = split[:len(split)-1]
 	}
 
-	// Return up to 3 parts.
-	if len(split) > 3 {
-		split = split[:3]
-	}
 	return split
 }
 
@@ -599,6 +668,9 @@ func splitPathDeterministic(in string) []string {
 type bloomFilterRequest struct {
 	Oldest  uint64
 	Current uint64
+	// If set the oldest clean version will be returned in OldestIdx
+	// and the rest of the request will be ignored.
+	OldestClean string
 }
 
 type bloomFilterResponse struct {
@@ -615,10 +687,9 @@ type bloomFilterResponse struct {
 }
 
 // ObjectPathUpdated indicates a path has been updated.
-// The function will never block.
+// The function will block until the entry has been picked up.
 func ObjectPathUpdated(s string) {
-	select {
-	case objectUpdatedCh <- s:
-	default:
+	if intDataUpdateTracker != nil {
+		intDataUpdateTracker.markDirty(s)
 	}
 }

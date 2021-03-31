@@ -17,20 +17,24 @@
 package cmd
 
 import (
+	"context"
 	"net/http"
+	"time"
 
+	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/madmin"
 )
 
 // getLocalServerProperty - returns madmin.ServerProperties for only the
 // local endpoints from given list of endpoints
-func getLocalServerProperty(endpointZones EndpointZones, r *http.Request) madmin.ServerProperties {
+func getLocalServerProperty(endpointServerPools EndpointServerPools, r *http.Request) madmin.ServerProperties {
+	var localEndpoints Endpoints
 	addr := r.Host
 	if globalIsDistErasure {
-		addr = GetLocalPeer(endpointZones)
+		addr = globalLocalNodeName
 	}
 	network := make(map[string]string)
-	for _, ep := range endpointZones {
+	for _, ep := range endpointServerPools {
 		for _, endpoint := range ep.Endpoints {
 			nodeName := endpoint.Host
 			if nodeName == "" {
@@ -38,26 +42,39 @@ func getLocalServerProperty(endpointZones EndpointZones, r *http.Request) madmin
 			}
 			if endpoint.IsLocal {
 				// Only proceed for local endpoints
-				network[nodeName] = "online"
+				network[nodeName] = string(madmin.ItemOnline)
+				localEndpoints = append(localEndpoints, endpoint)
 				continue
 			}
 			_, present := network[nodeName]
 			if !present {
-				if err := IsServerResolvable(endpoint); err == nil {
-					network[nodeName] = "online"
+				if err := isServerResolvable(endpoint, 2*time.Second); err == nil {
+					network[nodeName] = string(madmin.ItemOnline)
 				} else {
-					network[nodeName] = "offline"
+					network[nodeName] = string(madmin.ItemOffline)
+					// log once the error
+					logger.LogOnceIf(context.Background(), err, nodeName)
 				}
 			}
 		}
 	}
 
-	return madmin.ServerProperties{
-		State:    "ok",
+	props := madmin.ServerProperties{
+		State:    string(madmin.ItemInitializing),
 		Endpoint: addr,
 		Uptime:   UTCNow().Unix() - globalBootTime.Unix(),
 		Version:  Version,
 		CommitID: CommitID,
 		Network:  network,
 	}
+
+	objLayer := newObjectLayerFn()
+	if objLayer != nil && !globalIsGateway {
+		// only need Disks information in server mode.
+		storageInfo, _ := objLayer.LocalStorageInfo(GlobalContext)
+		props.State = string(madmin.ItemOnline)
+		props.Disks = storageInfo.Disks
+	}
+
+	return props
 }

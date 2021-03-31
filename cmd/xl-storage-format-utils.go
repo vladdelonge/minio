@@ -73,13 +73,18 @@ func getFileInfoVersions(xlMetaBuf []byte, volume, path string) (FileInfoVersion
 	}, nil
 }
 
-func getFileInfo(xlMetaBuf []byte, volume, path, versionID string) (FileInfo, error) {
+func getFileInfo(xlMetaBuf []byte, volume, path, versionID string, data bool) (FileInfo, error) {
 	if isXL2V1Format(xlMetaBuf) {
 		var xlMeta xlMetaV2
 		if err := xlMeta.Load(xlMetaBuf); err != nil {
 			return FileInfo{}, err
 		}
-		return xlMeta.ToFileInfo(volume, path, versionID)
+		fi, err := xlMeta.ToFileInfo(volume, path, versionID)
+		if !data || err != nil {
+			return fi, err
+		}
+		fi.Data = xlMeta.data.find(fi.DataDir)
+		return fi, nil
 	}
 
 	xlMeta := &xlMetaV1Object{}
@@ -93,4 +98,17 @@ func getFileInfo(xlMetaBuf []byte, volume, path, versionID string) (FileInfo, er
 	}
 	fi.XLV1 = true // indicates older version
 	return fi, err
+}
+
+// getXLDiskLoc will return the pool/set/disk id if it can be located in the object layer.
+// Will return -1 for unknown values.
+func getXLDiskLoc(diskID string) (poolIdx, setIdx, diskIdx int) {
+	if api := newObjectLayerFn(); api != nil {
+		if ep, ok := api.(*erasureServerPools); ok {
+			if pool, set, disk, err := ep.getPoolAndSet(diskID); err == nil {
+				return pool, set, disk
+			}
+		}
+	}
+	return -1, -1, -1
 }

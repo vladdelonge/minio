@@ -22,14 +22,13 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"math"
 	"net/http"
 	"os"
 	"reflect"
 	"strings"
 	"testing"
 
-	"github.com/klauspost/cpuid"
+	"github.com/klauspost/cpuid/v2"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/simdjson-go"
 )
@@ -338,6 +337,72 @@ func TestJSONQueries(t *testing.T) {
 }`,
 			wantResult: `{"element_type":"__elem__merfu","element_id":"d868aefe-ef9a-4be2-b9b2-c9fd89cc43eb","attributes":{"__attr__image_dpi":300,"__attr__image_size":[2550,3299],"__attr__image_index":2,"__attr__image_format":"JPEG","__attr__file_extension":"jpg","__attr__data":null}}`,
 		},
+		{
+			name:       "date_diff_month",
+			query:      `SELECT date_diff(MONTH, '2019-10-20T', '2020-01-20T') FROM S3Object LIMIT 1`,
+			wantResult: `{"_1":3}`,
+		},
+		{
+			name:       "date_diff_month_neg",
+			query:      `SELECT date_diff(MONTH, '2020-01-20T', '2019-10-20T') FROM S3Object LIMIT 1`,
+			wantResult: `{"_1":-3}`,
+		},
+		// Examples from https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-glacier-select-sql-reference-date.html#s3-glacier-select-sql-reference-date-diff
+		{
+			name:       "date_diff_year",
+			query:      `SELECT date_diff(year, '2010-01-01T', '2011-01-01T') FROM S3Object LIMIT 1`,
+			wantResult: `{"_1":1}`,
+		},
+		{
+			name:       "date_diff_year",
+			query:      `SELECT date_diff(month, '2010-01-01T', '2010-05T') FROM S3Object LIMIT 1`,
+			wantResult: `{"_1":4}`,
+		},
+		{
+			name:       "date_diff_month_oney",
+			query:      `SELECT date_diff(month, '2010T', '2011T') FROM S3Object LIMIT 1`,
+			wantResult: `{"_1":12}`,
+		},
+		{
+			name:       "date_diff_month_neg",
+			query:      `SELECT date_diff(month, '2011T', '2010T') FROM S3Object LIMIT 1`,
+			wantResult: `{"_1":-12}`,
+		},
+		{
+			name:       "date_diff_days",
+			query:      `SELECT date_diff(day, '2010-01-01T23:00:00Z', '2010-01-02T01:00:00Z') FROM S3Object LIMIT 1`,
+			wantResult: `{"_1":0}`,
+		},
+		{
+			name:       "date_diff_days_one",
+			query:      `SELECT date_diff(day, '2010-01-01T23:00:00Z', '2010-01-02T23:00:00Z') FROM S3Object LIMIT 1`,
+			wantResult: `{"_1":1}`,
+		},
+		{
+			name:       "cast_from_int_to_float",
+			query:      `SELECT cast(1 as float) FROM S3Object LIMIT 1`,
+			wantResult: `{"_1":1}`,
+		},
+		{
+			name:       "cast_from_float_to_float",
+			query:      `SELECT cast(1.0 as float) FROM S3Object LIMIT 1`,
+			wantResult: `{"_1":1}`,
+		},
+		{
+			name:       "arithmetic_integer_operand",
+			query:      `SELECT 1 / 2 FROM S3Object LIMIT 1`,
+			wantResult: `{"_1":0}`,
+		},
+		{
+			name:       "arithmetic_float_operand",
+			query:      `SELECT 1.0 / 2.0 * .3 FROM S3Object LIMIT 1`,
+			wantResult: `{"_1":0.15}`,
+		},
+		{
+			name:       "arithmetic_integer_float_operand",
+			query:      `SELECT 3.0 / 2, 5 / 2.0 FROM S3Object LIMIT 1`,
+			wantResult: `{"_1":1.5,"_2":2.5}`,
+		},
 	}
 
 	defRequest := `<?xml version="1.0" encoding="UTF-8"?>
@@ -363,11 +428,13 @@ func TestJSONQueries(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			// Hack cpuid to the CPU doesn't appear to support AVX2.
 			// Restore whatever happens.
-			defer func(f cpuid.Flags) {
-				cpuid.CPU.Features = f
-			}(cpuid.CPU.Features)
-			cpuid.CPU.Features &= math.MaxUint64 - cpuid.AVX2
-
+			if cpuid.CPU.Supports(cpuid.AVX2) {
+				cpuid.CPU.Disable(cpuid.AVX2)
+				defer cpuid.CPU.Enable(cpuid.AVX2)
+			}
+			if simdjson.SupportedCPU() {
+				t.Fatal("setup error: expected cpu to be unsupported")
+			}
 			testReq := testCase.requestXML
 			if len(testReq) == 0 {
 				var escaped bytes.Buffer

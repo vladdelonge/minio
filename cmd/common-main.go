@@ -17,31 +17,65 @@
 package cmd
 
 import (
+	"context"
 	"crypto/x509"
 	"encoding/gob"
 	"errors"
 	"fmt"
+	"math/rand"
 	"net"
 	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
+	"github.com/fatih/color"
 	dns2 "github.com/miekg/dns"
 	"github.com/minio/cli"
 	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio/cmd/config"
+	xhttp "github.com/minio/minio/cmd/http"
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/auth"
 	"github.com/minio/minio/pkg/certs"
+	"github.com/minio/minio/pkg/console"
 	"github.com/minio/minio/pkg/env"
+	"github.com/minio/minio/pkg/handlers"
 )
 
+// serverDebugLog will enable debug printing
+var serverDebugLog = env.Get("_MINIO_SERVER_DEBUG", config.EnableOff) == config.EnableOn
+
 func init() {
+	rand.Seed(time.Now().UTC().UnixNano())
+
 	logger.Init(GOPATH, GOROOT)
 	logger.RegisterError(config.FmtError)
+
+	// Inject into config package.
+	config.Logger.Info = logger.Info
+	config.Logger.LogIf = logger.LogIf
+
+	globalDNSCache = xhttp.NewDNSCache(10*time.Second, 10*time.Second, logger.LogOnceIf)
+
+	initGlobalContext()
+
+	globalForwarder = handlers.NewForwarder(&handlers.Forwarder{
+		PassHost:     true,
+		RoundTripper: newGatewayHTTPTransport(1 * time.Hour),
+		Logger: func(err error) {
+			if err != nil && !errors.Is(err, context.Canceled) {
+				logger.LogIf(GlobalContext, err)
+			}
+		},
+	})
+
+	globalTransitionState = newTransitionState()
+
+	console.SetColor("Debug", color.New())
 
 	gob.Register(StorageErr(""))
 }
@@ -59,10 +93,12 @@ func verifyObjectLayerFeatures(name string, objAPI ObjectLayer) {
 		}
 	}
 
+	globalCompressConfigMu.Lock()
 	if globalCompressConfig.Enabled && !objAPI.IsCompressionSupported() {
 		logger.Fatal(errInvalidArgument,
 			"Compression support is requested but '%s' does not support compression", name)
 	}
+	globalCompressConfigMu.Unlock()
 }
 
 // Check for updates and print a notification message
@@ -100,11 +136,7 @@ func checkUpdate(mode string) {
 		return
 	}
 
-	if globalInplaceUpdateDisabled {
-		logStartupMessage(updateMsg)
-	} else {
-		logStartupMessage(prepareUpdateMessage("Run `mc admin update`", lrTime.Sub(crTime)))
-	}
+	logStartupMessage(prepareUpdateMessage("Run `mc admin update`", lrTime.Sub(crTime)))
 }
 
 func newConfigDirFromCtx(ctx *cli.Context, option string, getDefaultDir func() string) (*ConfigDir, bool) {
@@ -226,6 +258,14 @@ func handleCommonEnvVars() {
 			}
 			globalDomainNames = append(globalDomainNames, domainName)
 		}
+		sort.Strings(globalDomainNames)
+		lcpSuf := lcpSuffix(globalDomainNames)
+		for _, domainName := range globalDomainNames {
+			if domainName == lcpSuf && len(globalDomainNames) > 1 {
+				logger.Fatal(config.ErrOverlappingDomainValue(nil).Msg("Overlapping domains `%s` not allowed", globalDomainNames),
+					"Invalid MINIO_DOMAIN value in environment variable")
+			}
+		}
 	}
 
 	publicIPs := env.Get(config.EnvPublicIPs, "")
@@ -271,6 +311,16 @@ func handleCommonEnvVars() {
 		globalConfigEncrypted = true
 	}
 
+	if env.IsSet(config.EnvRootUser) || env.IsSet(config.EnvRootPassword) {
+		cred, err := auth.CreateCredentials(env.Get(config.EnvRootUser, ""), env.Get(config.EnvRootPassword, ""))
+		if err != nil {
+			logger.Fatal(config.ErrInvalidCredentials(err),
+				"Unable to validate credentials inherited from the shell environment")
+		}
+		globalActiveCred = cred
+		globalConfigEncrypted = true
+	}
+
 	if env.IsSet(config.EnvAccessKeyOld) && env.IsSet(config.EnvSecretKeyOld) {
 		oldCred, err := auth.CreateCredentials(env.Get(config.EnvAccessKeyOld, ""), env.Get(config.EnvSecretKeyOld, ""))
 		if err != nil {
@@ -280,6 +330,17 @@ func handleCommonEnvVars() {
 		globalOldCred = oldCred
 		os.Unsetenv(config.EnvAccessKeyOld)
 		os.Unsetenv(config.EnvSecretKeyOld)
+	}
+
+	if env.IsSet(config.EnvRootUserOld) && env.IsSet(config.EnvRootPasswordOld) {
+		oldCred, err := auth.CreateCredentials(env.Get(config.EnvRootUserOld, ""), env.Get(config.EnvRootPasswordOld, ""))
+		if err != nil {
+			logger.Fatal(config.ErrInvalidCredentials(err),
+				"Unable to validate the old credentials inherited from the shell environment")
+		}
+		globalOldCred = oldCred
+		os.Unsetenv(config.EnvRootUserOld)
+		os.Unsetenv(config.EnvRootPasswordOld)
 	}
 }
 
@@ -334,13 +395,22 @@ func getTLSConfig() (x509Certs []*x509.Certificate, manager *certs.Manager, secu
 		return nil, nil, false, err
 	}
 	for _, file := range files {
-		// We exclude any regular file and the "CAs/" directory.
-		// The "CAs/" directory contains (root) CA certificates
-		// that MinIO adds to its list of trusted roots (tls.Config.RootCAs).
-		// Therefore, "CAs/" does not contain X.509 certificates that
-		// are meant to be served by MinIO.
-		if !file.IsDir() || file.Name() == "CAs" {
+		// Ignore all
+		// - regular files
+		// - "CAs" directory
+		// - any directory which starts with ".."
+		if file.Mode().IsRegular() || file.Name() == "CAs" || strings.HasPrefix(file.Name(), "..") {
 			continue
+		}
+		if file.Mode()&os.ModeSymlink == os.ModeSymlink {
+			file, err = os.Stat(filepath.Join(root.Name(), file.Name()))
+			if err != nil {
+				// not accessible ignore
+				continue
+			}
+			if !file.IsDir() {
+				continue
+			}
 		}
 
 		var (
@@ -350,11 +420,21 @@ func getTLSConfig() (x509Certs []*x509.Certificate, manager *certs.Manager, secu
 		if !isFile(certFile) || !isFile(keyFile) {
 			continue
 		}
-		if err := manager.AddCertificate(certFile, keyFile); err != nil {
-			err = fmt.Errorf("Failed to load TLS certificate '%s': %v", certFile, err)
+		if err = manager.AddCertificate(certFile, keyFile); err != nil {
+			err = fmt.Errorf("Unable to load TLS certificate '%s,%s': %w", certFile, keyFile, err)
 			logger.LogIf(GlobalContext, err, logger.Minio)
 		}
 	}
 	secureConn = true
 	return x509Certs, manager, secureConn, nil
+}
+
+// contextCanceled returns whether a context is canceled.
+func contextCanceled(ctx context.Context) bool {
+	select {
+	case <-ctx.Done():
+		return true
+	default:
+		return false
+	}
 }

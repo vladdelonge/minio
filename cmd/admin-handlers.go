@@ -35,14 +35,14 @@ import (
 	"time"
 
 	"github.com/gorilla/mux"
-
 	"github.com/minio/minio/cmd/config"
-	"github.com/minio/minio/cmd/config/notify"
 	"github.com/minio/minio/cmd/crypto"
 	xhttp "github.com/minio/minio/cmd/http"
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/cmd/logger/message/log"
 	"github.com/minio/minio/pkg/auth"
+	"github.com/minio/minio/pkg/bandwidth"
+	"github.com/minio/minio/pkg/dsync"
 	"github.com/minio/minio/pkg/handlers"
 	iampolicy "github.com/minio/minio/pkg/iam/policy"
 	"github.com/minio/minio/pkg/madmin"
@@ -79,7 +79,7 @@ func updateServer(u *url.URL, sha256Sum []byte, lrTime time.Time, mode string) (
 func (a adminAPIHandlers) ServerUpdateHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, w, "ServerUpdate")
 
-	defer logger.AuditLog(w, r, "ServerUpdate", mustGetClaimsFromToken(r))
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 
 	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.ServerUpdateAdminAction)
 	if objectAPI == nil {
@@ -87,8 +87,7 @@ func (a adminAPIHandlers) ServerUpdateHandler(w http.ResponseWriter, r *http.Req
 	}
 
 	if globalInplaceUpdateDisabled {
-		// if MINIO_UPDATE=off - inplace update is disabled, mostly
-		// in containers.
+		// if MINIO_UPDATE=off - inplace update is disabled, mostly in containers.
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrMethodNotAllowed), r.URL)
 		return
 	}
@@ -129,7 +128,7 @@ func (a adminAPIHandlers) ServerUpdateHandler(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	if lrTime.Sub(crTime) < 0 {
+	if lrTime.Sub(crTime) <= 0 {
 		updateStatus := madmin.ServerUpdateStatus{
 			CurrentVersion: Version,
 			UpdatedVersion: Version,
@@ -189,7 +188,7 @@ func (a adminAPIHandlers) ServerUpdateHandler(w http.ResponseWriter, r *http.Req
 func (a adminAPIHandlers) ServiceHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, w, "Service")
 
-	defer logger.AuditLog(w, r, "Service", mustGetClaimsFromToken(r))
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 
 	vars := mux.Vars(r)
 	action := vars["action"]
@@ -207,9 +206,10 @@ func (a adminAPIHandlers) ServiceHandler(w http.ResponseWriter, r *http.Request)
 	}
 
 	var objectAPI ObjectLayer
-	if serviceSig == serviceRestart {
+	switch serviceSig {
+	case serviceRestart:
 		objectAPI, _ = validateAdminReq(ctx, w, r, iampolicy.ServiceRestartAdminAction)
-	} else {
+	case serviceStop:
 		objectAPI, _ = validateAdminReq(ctx, w, r, iampolicy.ServiceStopAdminAction)
 	}
 	if objectAPI == nil {
@@ -259,9 +259,11 @@ type ServerHTTPAPIStats struct {
 // ServerHTTPStats holds all type of http operations performed to/from the server
 // including their average execution time.
 type ServerHTTPStats struct {
+	S3RequestsInQueue int32              `json:"s3RequestsInQueue"`
 	CurrentS3Requests ServerHTTPAPIStats `json:"currentS3Requests"`
 	TotalS3Requests   ServerHTTPAPIStats `json:"totalS3Requests"`
 	TotalS3Errors     ServerHTTPAPIStats `json:"totalS3Errors"`
+	TotalS3Canceled   ServerHTTPAPIStats `json:"totalS3Canceled"`
 }
 
 // ServerInfoData holds storage, connections and other
@@ -285,7 +287,7 @@ type ServerInfo struct {
 func (a adminAPIHandlers) StorageInfoHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, w, "StorageInfo")
 
-	defer logger.AuditLog(w, r, "StorageInfo", mustGetClaimsFromToken(r))
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 
 	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.StorageInfoAdminAction)
 	if objectAPI == nil {
@@ -293,10 +295,10 @@ func (a adminAPIHandlers) StorageInfoHandler(w http.ResponseWriter, r *http.Requ
 	}
 
 	// ignores any errors here.
-	storageInfo, _ := objectAPI.StorageInfo(ctx, false)
+	storageInfo, _ := objectAPI.StorageInfo(ctx)
 
 	// Collect any disk healing.
-	healing, _ := getAggregatedBackgroundHealState(ctx)
+	healing, _ := getAggregatedBackgroundHealState(ctx, nil)
 	healDisks := make(map[string]struct{}, len(healing.HealDisks))
 	for _, disk := range healing.HealDisks {
 		healDisks[disk] = struct{}{}
@@ -328,7 +330,7 @@ func (a adminAPIHandlers) StorageInfoHandler(w http.ResponseWriter, r *http.Requ
 func (a adminAPIHandlers) DataUsageInfoHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, w, "DataUsageInfo")
 
-	defer logger.AuditLog(w, r, "DataUsageInfo", mustGetClaimsFromToken(r))
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 
 	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.DataUsageInfoAdminAction)
 	if objectAPI == nil {
@@ -350,7 +352,7 @@ func (a adminAPIHandlers) DataUsageInfoHandler(w http.ResponseWriter, r *http.Re
 	writeSuccessResponseJSON(w, dataUsageInfoJSON)
 }
 
-func lriToLockEntry(l lockRequesterInfo, resource, server string, rquorum, wquorum int) *madmin.LockEntry {
+func lriToLockEntry(l lockRequesterInfo, resource, server string) *madmin.LockEntry {
 	entry := &madmin.LockEntry{
 		Timestamp:  l.Timestamp,
 		Resource:   resource,
@@ -358,40 +360,34 @@ func lriToLockEntry(l lockRequesterInfo, resource, server string, rquorum, wquor
 		Source:     l.Source,
 		Owner:      l.Owner,
 		ID:         l.UID,
+		Quorum:     l.Quorum,
 	}
 	if l.Writer {
 		entry.Type = "WRITE"
-		entry.Quorum = wquorum
 	} else {
 		entry.Type = "READ"
-		entry.Quorum = rquorum
 	}
 	return entry
 }
 
-func topLockEntries(peerLocks []*PeerLocks, count int, rquorum, wquorum int, stale bool) madmin.LockEntries {
+func topLockEntries(peerLocks []*PeerLocks, stale bool) madmin.LockEntries {
 	entryMap := make(map[string]*madmin.LockEntry)
 	for _, peerLock := range peerLocks {
 		if peerLock == nil {
 			continue
 		}
-		for _, locks := range peerLock.Locks {
-			for k, v := range locks {
-				for _, lockReqInfo := range v {
-					if val, ok := entryMap[lockReqInfo.UID]; ok {
-						val.ServerList = append(val.ServerList, peerLock.Addr)
-					} else {
-						entryMap[lockReqInfo.UID] = lriToLockEntry(lockReqInfo, k, peerLock.Addr, rquorum, wquorum)
-					}
+		for k, v := range peerLock.Locks {
+			for _, lockReqInfo := range v {
+				if val, ok := entryMap[lockReqInfo.UID]; ok {
+					val.ServerList = append(val.ServerList, peerLock.Addr)
+				} else {
+					entryMap[lockReqInfo.UID] = lriToLockEntry(lockReqInfo, k, peerLock.Addr)
 				}
 			}
 		}
 	}
 	var lockEntries madmin.LockEntries
 	for _, v := range entryMap {
-		if len(lockEntries) == count {
-			break
-		}
 		if stale {
 			lockEntries = append(lockEntries, *v)
 			continue
@@ -407,14 +403,53 @@ func topLockEntries(peerLocks []*PeerLocks, count int, rquorum, wquorum int, sta
 // PeerLocks holds server information result of one node
 type PeerLocks struct {
 	Addr  string
-	Locks GetLocksResp
+	Locks map[string][]lockRequesterInfo
+}
+
+// ForceUnlockHandler force unlocks requested resource
+func (a adminAPIHandlers) ForceUnlockHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := newContext(r, w, "ForceUnlock")
+
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+
+	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.ForceUnlockAdminAction)
+	if objectAPI == nil {
+		return
+	}
+
+	z, ok := objectAPI.(*erasureServerPools)
+	if !ok {
+		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrNotImplemented), r.URL)
+		return
+	}
+
+	vars := mux.Vars(r)
+
+	var args dsync.LockArgs
+	lockersMap := make(map[string]dsync.NetLocker)
+	for _, path := range strings.Split(vars["paths"], ",") {
+		if path == "" {
+			continue
+		}
+		args.Resources = append(args.Resources, path)
+		lockers, _ := z.serverPools[0].getHashedSet(path).getLockers()
+		for _, locker := range lockers {
+			if locker != nil {
+				lockersMap[locker.String()] = locker
+			}
+		}
+	}
+
+	for _, locker := range lockersMap {
+		locker.ForceUnlock(ctx, args)
+	}
 }
 
 // TopLocksHandler Get list of locks in use
 func (a adminAPIHandlers) TopLocksHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, w, "TopLocks")
 
-	defer logger.AuditLog(w, r, "TopLocks", mustGetClaimsFromToken(r))
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 
 	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.TopLocksAdminAction)
 	if objectAPI == nil {
@@ -434,12 +469,13 @@ func (a adminAPIHandlers) TopLocksHandler(w http.ResponseWriter, r *http.Request
 
 	peerLocks := globalNotificationSys.GetLocks(ctx, r)
 
-	rquorum := getReadQuorum(objectAPI.SetDriveCount())
-	wquorum := getWriteQuorum(objectAPI.SetDriveCount())
+	topLocks := topLockEntries(peerLocks, stale)
 
-	topLocks := topLockEntries(peerLocks, count, rquorum, wquorum, stale)
+	// Marshal API response upto requested count.
+	if len(topLocks) > count && count > 0 {
+		topLocks = topLocks[:count]
+	}
 
-	// Marshal API response
 	jsonBytes, err := json.Marshal(topLocks)
 	if err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
@@ -465,16 +501,23 @@ type StartProfilingResult struct {
 func (a adminAPIHandlers) StartProfilingHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, w, "StartProfiling")
 
-	defer logger.AuditLog(w, r, "StartProfiling", mustGetClaimsFromToken(r))
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 
-	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.ProfilingAdminAction)
-	if objectAPI == nil {
+	// Validate request signature.
+	_, adminAPIErr := checkAdminRequestAuth(ctx, r, iampolicy.ProfilingAdminAction, "")
+	if adminAPIErr != ErrNone {
+		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(adminAPIErr), r.URL)
+		return
+	}
+
+	if globalNotificationSys == nil {
+		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrServerNotInitialized), r.URL)
 		return
 	}
 
 	vars := mux.Vars(r)
 	profiles := strings.Split(vars["profilerType"], ",")
-	thisAddr, err := xnet.ParseHost(GetLocalPeer(globalEndpoints))
+	thisAddr, err := xnet.ParseHost(globalLocalNodeName)
 	if err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
@@ -563,10 +606,17 @@ func (f dummyFileInfo) Sys() interface{}   { return f.sys }
 func (a adminAPIHandlers) DownloadProfilingHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, w, "DownloadProfiling")
 
-	defer logger.AuditLog(w, r, "DownloadProfiling", mustGetClaimsFromToken(r))
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 
-	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.ProfilingAdminAction)
-	if objectAPI == nil {
+	// Validate request signature.
+	_, adminAPIErr := checkAdminRequestAuth(ctx, r, iampolicy.ProfilingAdminAction, "")
+	if adminAPIErr != ErrNone {
+		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(adminAPIErr), r.URL)
+		return
+	}
+
+	if globalNotificationSys == nil {
+		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrServerNotInitialized), r.URL)
 		return
 	}
 
@@ -657,7 +707,7 @@ func extractHealInitParams(vars map[string]string, qParms url.Values, r io.Reade
 func (a adminAPIHandlers) HealHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, w, "Heal")
 
-	defer logger.AuditLog(w, r, "Heal", mustGetClaimsFromToken(r))
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 
 	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.HealAdminAction)
 	if objectAPI == nil {
@@ -800,7 +850,7 @@ func (a adminAPIHandlers) HealHandler(w http.ResponseWriter, r *http.Request) {
 	case hip.clientToken == "":
 		nh := newHealSequence(GlobalContext, hip.bucket, hip.objPrefix, handlers.GetSourceIP(r), hip.hs, hip.forceStart)
 		go func() {
-			respBytes, apiErr, errMsg := globalAllHealState.LaunchNewHealSequence(nh)
+			respBytes, apiErr, errMsg := globalAllHealState.LaunchNewHealSequence(nh, objectAPI)
 			hr := healResp{respBytes, apiErr, errMsg}
 			respCh <- hr
 		}()
@@ -812,16 +862,14 @@ func (a adminAPIHandlers) HealHandler(w http.ResponseWriter, r *http.Request) {
 	keepConnLive(w, r, respCh)
 }
 
-func getAggregatedBackgroundHealState(ctx context.Context) (madmin.BgHealState, error) {
-	var bgHealStates []madmin.BgHealState
-
-	localHealState, ok := getLocalBackgroundHealStatus()
-	if !ok {
-		return madmin.BgHealState{}, errServerNotInitialized
-	}
-
+// getAggregatedBackgroundHealState returns the heal state of disks.
+// If no ObjectLayer is provided no set status is returned.
+func getAggregatedBackgroundHealState(ctx context.Context, o ObjectLayer) (madmin.BgHealState, error) {
 	// Get local heal status first
-	bgHealStates = append(bgHealStates, localHealState)
+	bgHealStates, ok := getBackgroundHealStatus(ctx, o)
+	if !ok {
+		return bgHealStates, errServerNotInitialized
+	}
 
 	if globalIsDistErasure {
 		// Get heal status from other peers
@@ -836,39 +884,16 @@ func getAggregatedBackgroundHealState(ctx context.Context) (madmin.BgHealState, 
 		if errCount == len(nerrs) {
 			return madmin.BgHealState{}, fmt.Errorf("all remote servers failed to report heal status, cluster is unhealthy")
 		}
-		bgHealStates = append(bgHealStates, peersHealStates...)
+		bgHealStates.Merge(peersHealStates...)
 	}
 
-	// Aggregate healing result
-	var aggregatedHealStateResult = madmin.BgHealState{
-		ScannedItemsCount: bgHealStates[0].ScannedItemsCount,
-		LastHealActivity:  bgHealStates[0].LastHealActivity,
-		NextHealRound:     bgHealStates[0].NextHealRound,
-		HealDisks:         bgHealStates[0].HealDisks,
-	}
-
-	bgHealStates = bgHealStates[1:]
-
-	for _, state := range bgHealStates {
-		aggregatedHealStateResult.ScannedItemsCount += state.ScannedItemsCount
-		aggregatedHealStateResult.HealDisks = append(aggregatedHealStateResult.HealDisks, state.HealDisks...)
-		if !state.LastHealActivity.IsZero() && aggregatedHealStateResult.LastHealActivity.Before(state.LastHealActivity) {
-			aggregatedHealStateResult.LastHealActivity = state.LastHealActivity
-			// The node which has the last heal activity means its
-			// is the node that is orchestrating self healing operations,
-			// which also means it is the same node which decides when
-			// the next self healing operation will be done.
-			aggregatedHealStateResult.NextHealRound = state.NextHealRound
-		}
-	}
-
-	return aggregatedHealStateResult, nil
+	return bgHealStates, nil
 }
 
 func (a adminAPIHandlers) BackgroundHealStatusHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, w, "HealBackgroundStatus")
 
-	defer logger.AuditLog(w, r, "HealBackgroundStatus", mustGetClaimsFromToken(r))
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 
 	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.HealAdminAction)
 	if objectAPI == nil {
@@ -881,7 +906,7 @@ func (a adminAPIHandlers) BackgroundHealStatusHandler(w http.ResponseWriter, r *
 		return
 	}
 
-	aggregateHealStateResult, err := getAggregatedBackgroundHealState(r.Context())
+	aggregateHealStateResult, err := getAggregatedBackgroundHealState(r.Context(), objectAPI)
 	if err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
@@ -899,14 +924,14 @@ func validateAdminReq(ctx context.Context, w http.ResponseWriter, r *http.Reques
 	var cred auth.Credentials
 	var adminAPIErr APIErrorCode
 	// Get current object layer instance.
-	objectAPI := newObjectLayerWithoutSafeModeFn()
+	objectAPI := newObjectLayerFn()
 	if objectAPI == nil || globalNotificationSys == nil {
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrServerNotInitialized), r.URL)
 		return nil, cred
 	}
 
 	// Validate request signature.
-	cred, adminAPIErr = checkAdminRequestAuthType(ctx, r, action, "")
+	cred, adminAPIErr = checkAdminRequestAuth(ctx, r, action, "")
 	if adminAPIErr != ErrNone {
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(adminAPIErr), r.URL)
 		return nil, cred
@@ -1006,17 +1031,75 @@ func toAdminAPIErr(ctx context.Context, err error) APIError {
 // false if certain conditions are not met.
 // - input entry is not of the type *trace.Info*
 // - errOnly entries are to be traced, not status code 2xx, 3xx.
-// - all entries to be traced, if not trace only S3 API requests.
-func mustTrace(entry interface{}, trcAll, errOnly bool) bool {
+// - trace.Info type is asked by opts
+func mustTrace(entry interface{}, opts madmin.ServiceTraceOpts) (shouldTrace bool) {
 	trcInfo, ok := entry.(trace.Info)
 	if !ok {
 		return false
 	}
-	trace := trcAll || !HasPrefix(trcInfo.ReqInfo.Path, minioReservedBucketPath+SlashSeparator)
-	if errOnly {
-		return trace && trcInfo.RespInfo.StatusCode >= http.StatusBadRequest
+
+	// Override shouldTrace decision with errOnly filtering
+	defer func() {
+		if shouldTrace && opts.OnlyErrors {
+			shouldTrace = trcInfo.RespInfo.StatusCode >= http.StatusBadRequest
+		}
+	}()
+
+	if opts.Threshold > 0 {
+		var latency time.Duration
+		switch trcInfo.TraceType {
+		case trace.OS:
+			latency = trcInfo.OSStats.Duration
+		case trace.Storage:
+			latency = trcInfo.StorageStats.Duration
+		case trace.HTTP:
+			latency = trcInfo.CallStats.Latency
+		}
+		if latency < opts.Threshold {
+			return false
+		}
 	}
-	return trace
+
+	if opts.Internal && trcInfo.TraceType == trace.HTTP && HasPrefix(trcInfo.ReqInfo.Path, minioReservedBucketPath+SlashSeparator) {
+		return true
+	}
+
+	if opts.S3 && trcInfo.TraceType == trace.HTTP && !HasPrefix(trcInfo.ReqInfo.Path, minioReservedBucketPath+SlashSeparator) {
+		return true
+	}
+
+	if opts.Storage && trcInfo.TraceType == trace.Storage {
+		return true
+	}
+
+	return opts.OS && trcInfo.TraceType == trace.OS
+}
+
+func extractTraceOptions(r *http.Request) (opts madmin.ServiceTraceOpts, err error) {
+	q := r.URL.Query()
+
+	opts.OnlyErrors = q.Get("err") == "true"
+	opts.S3 = q.Get("s3") == "true"
+	opts.Internal = q.Get("internal") == "true"
+	opts.Storage = q.Get("storage") == "true"
+	opts.OS = q.Get("os") == "true"
+
+	// Support deprecated 'all' query
+	if q.Get("all") == "true" {
+		opts.S3 = true
+		opts.Internal = true
+		opts.Storage = true
+		opts.OS = true
+	}
+
+	if t := q.Get("threshold"); t != "" {
+		d, err := time.ParseDuration(t)
+		if err != nil {
+			return opts, err
+		}
+		opts.Threshold = d
+	}
+	return
 }
 
 // TraceHandler - POST /minio/admin/v3/trace
@@ -1025,13 +1108,16 @@ func mustTrace(entry interface{}, trcAll, errOnly bool) bool {
 func (a adminAPIHandlers) TraceHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, w, "HTTPTrace")
 
-	trcAll := r.URL.Query().Get("all") == "true"
-	trcErr := r.URL.Query().Get("err") == "true"
-
 	// Validate request signature.
-	_, adminAPIErr := checkAdminRequestAuthType(ctx, r, iampolicy.TraceAdminAction, "")
+	_, adminAPIErr := checkAdminRequestAuth(ctx, r, iampolicy.TraceAdminAction, "")
 	if adminAPIErr != ErrNone {
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(adminAPIErr), r.URL)
+		return
+	}
+
+	traceOpts, err := extractTraceOptions(r)
+	if err != nil {
+		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrInvalidRequest), r.URL)
 		return
 	}
 
@@ -1041,17 +1127,17 @@ func (a adminAPIHandlers) TraceHandler(w http.ResponseWriter, r *http.Request) {
 	// Use buffered channel to take care of burst sends or slow w.Write()
 	traceCh := make(chan interface{}, 4000)
 
-	peers := newPeerRestClients(globalEndpoints)
+	peers, _ := newPeerRestClients(globalEndpoints)
 
-	globalHTTPTrace.Subscribe(traceCh, ctx.Done(), func(entry interface{}) bool {
-		return mustTrace(entry, trcAll, trcErr)
+	globalTrace.Subscribe(traceCh, ctx.Done(), func(entry interface{}) bool {
+		return mustTrace(entry, traceOpts)
 	})
 
 	for _, peer := range peers {
 		if peer == nil {
 			continue
 		}
-		peer.Trace(traceCh, ctx.Done(), trcAll, trcErr)
+		peer.Trace(traceCh, ctx.Done(), traceOpts)
 	}
 
 	keepAliveTicker := time.NewTicker(500 * time.Millisecond)
@@ -1080,7 +1166,7 @@ func (a adminAPIHandlers) TraceHandler(w http.ResponseWriter, r *http.Request) {
 func (a adminAPIHandlers) ConsoleLogHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, w, "ConsoleLog")
 
-	defer logger.AuditLog(w, r, "ConsoleLog", mustGetClaimsFromToken(r))
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 
 	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.ConsoleLogAdminAction)
 	if objectAPI == nil {
@@ -1109,7 +1195,7 @@ func (a adminAPIHandlers) ConsoleLogHandler(w http.ResponseWriter, r *http.Reque
 
 	logCh := make(chan interface{}, 4000)
 
-	peers := newPeerRestClients(globalEndpoints)
+	peers, _ := newPeerRestClients(globalEndpoints)
 
 	globalConsoleSys.Subscribe(logCh, ctx.Done(), node, limitLines, logKind, nil)
 
@@ -1151,7 +1237,7 @@ func (a adminAPIHandlers) ConsoleLogHandler(w http.ResponseWriter, r *http.Reque
 // KMSCreateKeyHandler - POST /minio/admin/v3/kms/key/create?key-id=<master-key-id>
 func (a adminAPIHandlers) KMSCreateKeyHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, w, "KMSCreateKey")
-	defer logger.AuditLog(w, r, "KMSCreateKey", mustGetClaimsFromToken(r))
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 
 	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.KMSCreateKeyAdminAction)
 	if objectAPI == nil {
@@ -1174,7 +1260,7 @@ func (a adminAPIHandlers) KMSCreateKeyHandler(w http.ResponseWriter, r *http.Req
 func (a adminAPIHandlers) KMSKeyStatusHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, w, "KMSKeyStatus")
 
-	defer logger.AuditLog(w, r, "KMSKeyStatus", mustGetClaimsFromToken(r))
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 
 	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.KMSKeyStatusAdminAction)
 	if objectAPI == nil {
@@ -1241,26 +1327,26 @@ func (a adminAPIHandlers) KMSKeyStatusHandler(w http.ResponseWriter, r *http.Req
 	writeSuccessResponseJSON(w, resp)
 }
 
-// OBDInfoHandler - GET /minio/admin/v3/obdinfo
+// HealthInfoHandler - GET /minio/admin/v3/healthinfo
 // ----------
-// Get server on-board diagnostics
-func (a adminAPIHandlers) OBDInfoHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "OBDInfo")
+// Get server health info
+func (a adminAPIHandlers) HealthInfoHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := newContext(r, w, "HealthInfo")
 
-	defer logger.AuditLog(w, r, "OBDInfo", mustGetClaimsFromToken(r))
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 
-	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.OBDInfoAdminAction)
+	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.HealthInfoAdminAction)
 	if objectAPI == nil {
 		return
 	}
 
 	query := r.URL.Query()
-	obdInfo := madmin.OBDInfo{}
-	obdInfoCh := make(chan madmin.OBDInfo)
+	healthInfo := madmin.HealthInfo{}
+	healthInfoCh := make(chan madmin.HealthInfo)
 
 	enc := json.NewEncoder(w)
-	partialWrite := func(oinfo madmin.OBDInfo) {
-		obdInfoCh <- oinfo
+	partialWrite := func(oinfo madmin.HealthInfo) {
+		healthInfoCh <- oinfo
 	}
 
 	setCommonHeaders(w)
@@ -1273,8 +1359,8 @@ func (a adminAPIHandlers) OBDInfoHandler(w http.ResponseWriter, r *http.Request)
 		errorResponse := getAPIErrorResponse(ctx, toAdminAPIErr(ctx, err), r.URL.String(),
 			w.Header().Get(xhttp.AmzRequestID), globalDeploymentID)
 		encodedErrorResponse := encodeResponse(errorResponse)
-		obdInfo.Error = string(encodedErrorResponse)
-		logger.LogIf(ctx, enc.Encode(obdInfo))
+		healthInfo.Error = string(encodedErrorResponse)
+		logger.LogIf(ctx, enc.Encode(healthInfo))
 	}
 
 	deadline := 3600 * time.Second
@@ -1290,123 +1376,119 @@ func (a adminAPIHandlers) OBDInfoHandler(w http.ResponseWriter, r *http.Request)
 	deadlinedCtx, cancel := context.WithTimeout(ctx, deadline)
 	defer cancel()
 
-	nsLock := objectAPI.NewNSLock(ctx, minioMetaBucket, "obd-in-progress")
-	if err := nsLock.GetLock(newDynamicTimeout(deadline, deadline)); err != nil { // returns a locked lock
+	var err error
+	nsLock := objectAPI.NewNSLock(minioMetaBucket, "health-check-in-progress")
+	ctx, err = nsLock.GetLock(ctx, newDynamicTimeout(deadline, deadline))
+	if err != nil { // returns a locked lock
 		errResp(err)
 		return
 	}
 	defer nsLock.Unlock()
 
 	go func() {
-		defer close(obdInfoCh)
-
-		if log := query.Get("log"); log == "true" {
-			obdInfo.Logging.ServersLog = append(obdInfo.Logging.ServersLog, getLocalLogOBD(deadlinedCtx, r))
-			obdInfo.Logging.ServersLog = append(obdInfo.Logging.ServersLog, globalNotificationSys.LogOBDInfo(deadlinedCtx)...)
-			partialWrite(obdInfo)
-		}
+		defer close(healthInfoCh)
 
 		if cpu := query.Get("syscpu"); cpu == "true" {
-			cpuInfo := getLocalCPUOBDInfo(deadlinedCtx, r)
+			cpuInfo := getLocalCPUInfo(deadlinedCtx, r)
 
-			obdInfo.Sys.CPUInfo = append(obdInfo.Sys.CPUInfo, cpuInfo)
-			obdInfo.Sys.CPUInfo = append(obdInfo.Sys.CPUInfo, globalNotificationSys.CPUOBDInfo(deadlinedCtx)...)
-			partialWrite(obdInfo)
+			healthInfo.Sys.CPUInfo = append(healthInfo.Sys.CPUInfo, cpuInfo)
+			healthInfo.Sys.CPUInfo = append(healthInfo.Sys.CPUInfo, globalNotificationSys.CPUInfo(deadlinedCtx)...)
+			partialWrite(healthInfo)
 		}
 
 		if diskHw := query.Get("sysdiskhw"); diskHw == "true" {
-			diskHwInfo := getLocalDiskHwOBD(deadlinedCtx, r)
+			diskHwInfo := getLocalDiskHwInfo(deadlinedCtx, r)
 
-			obdInfo.Sys.DiskHwInfo = append(obdInfo.Sys.DiskHwInfo, diskHwInfo)
-			obdInfo.Sys.DiskHwInfo = append(obdInfo.Sys.DiskHwInfo, globalNotificationSys.DiskHwOBDInfo(deadlinedCtx)...)
-			partialWrite(obdInfo)
+			healthInfo.Sys.DiskHwInfo = append(healthInfo.Sys.DiskHwInfo, diskHwInfo)
+			healthInfo.Sys.DiskHwInfo = append(healthInfo.Sys.DiskHwInfo, globalNotificationSys.DiskHwInfo(deadlinedCtx)...)
+			partialWrite(healthInfo)
 		}
 
 		if osInfo := query.Get("sysosinfo"); osInfo == "true" {
-			osInfo := getLocalOsInfoOBD(deadlinedCtx, r)
+			osInfo := getLocalOsInfo(deadlinedCtx, r)
 
-			obdInfo.Sys.OsInfo = append(obdInfo.Sys.OsInfo, osInfo)
-			obdInfo.Sys.OsInfo = append(obdInfo.Sys.OsInfo, globalNotificationSys.OsOBDInfo(deadlinedCtx)...)
-			partialWrite(obdInfo)
+			healthInfo.Sys.OsInfo = append(healthInfo.Sys.OsInfo, osInfo)
+			healthInfo.Sys.OsInfo = append(healthInfo.Sys.OsInfo, globalNotificationSys.OsInfo(deadlinedCtx)...)
+			partialWrite(healthInfo)
 		}
 
 		if mem := query.Get("sysmem"); mem == "true" {
-			memInfo := getLocalMemOBD(deadlinedCtx, r)
+			memInfo := getLocalMemInfo(deadlinedCtx, r)
 
-			obdInfo.Sys.MemInfo = append(obdInfo.Sys.MemInfo, memInfo)
-			obdInfo.Sys.MemInfo = append(obdInfo.Sys.MemInfo, globalNotificationSys.MemOBDInfo(deadlinedCtx)...)
-			partialWrite(obdInfo)
+			healthInfo.Sys.MemInfo = append(healthInfo.Sys.MemInfo, memInfo)
+			healthInfo.Sys.MemInfo = append(healthInfo.Sys.MemInfo, globalNotificationSys.MemInfo(deadlinedCtx)...)
+			partialWrite(healthInfo)
 		}
 
 		if proc := query.Get("sysprocess"); proc == "true" {
-			procInfo := getLocalProcOBD(deadlinedCtx, r)
+			procInfo := getLocalProcInfo(deadlinedCtx, r)
 
-			obdInfo.Sys.ProcInfo = append(obdInfo.Sys.ProcInfo, procInfo)
-			obdInfo.Sys.ProcInfo = append(obdInfo.Sys.ProcInfo, globalNotificationSys.ProcOBDInfo(deadlinedCtx)...)
-			partialWrite(obdInfo)
+			healthInfo.Sys.ProcInfo = append(healthInfo.Sys.ProcInfo, procInfo)
+			healthInfo.Sys.ProcInfo = append(healthInfo.Sys.ProcInfo, globalNotificationSys.ProcInfo(deadlinedCtx)...)
+			partialWrite(healthInfo)
 		}
 
 		if config := query.Get("minioconfig"); config == "true" {
 			cfg, err := readServerConfig(ctx, objectAPI)
 			logger.LogIf(ctx, err)
-			obdInfo.Minio.Config = cfg
-			partialWrite(obdInfo)
+			healthInfo.Minio.Config = cfg
+			partialWrite(healthInfo)
 		}
 
 		if drive := query.Get("perfdrive"); drive == "true" {
-			// Get drive obd details from local server's drive(s)
-			driveOBDSerial := getLocalDrivesOBD(deadlinedCtx, false, globalEndpoints, r)
-			driveOBDParallel := getLocalDrivesOBD(deadlinedCtx, true, globalEndpoints, r)
+			// Get drive perf details from local server's drive(s)
+			drivePerfSerial := getLocalDrives(deadlinedCtx, false, globalEndpoints, r)
+			drivePerfParallel := getLocalDrives(deadlinedCtx, true, globalEndpoints, r)
 
 			errStr := ""
-			if driveOBDSerial.Error != "" {
-				errStr = "serial: " + driveOBDSerial.Error
+			if drivePerfSerial.Error != "" {
+				errStr = "serial: " + drivePerfSerial.Error
 			}
-			if driveOBDParallel.Error != "" {
-				errStr = errStr + " parallel: " + driveOBDParallel.Error
+			if drivePerfParallel.Error != "" {
+				errStr = errStr + " parallel: " + drivePerfParallel.Error
 			}
 
-			driveOBD := madmin.ServerDrivesOBDInfo{
-				Addr:     driveOBDSerial.Addr,
-				Serial:   driveOBDSerial.Serial,
-				Parallel: driveOBDParallel.Parallel,
+			driveInfo := madmin.ServerDrivesInfo{
+				Addr:     drivePerfSerial.Addr,
+				Serial:   drivePerfSerial.Serial,
+				Parallel: drivePerfParallel.Parallel,
 				Error:    errStr,
 			}
-			obdInfo.Perf.DriveInfo = append(obdInfo.Perf.DriveInfo, driveOBD)
-			partialWrite(obdInfo)
+			healthInfo.Perf.DriveInfo = append(healthInfo.Perf.DriveInfo, driveInfo)
+			partialWrite(healthInfo)
 
-			// Notify all other MinIO peers to report drive obd numbers
-			driveOBDs := globalNotificationSys.DriveOBDInfoChan(deadlinedCtx)
-			for obd := range driveOBDs {
-				obdInfo.Perf.DriveInfo = append(obdInfo.Perf.DriveInfo, obd)
-				partialWrite(obdInfo)
+			// Notify all other MinIO peers to report drive perf numbers
+			driveInfos := globalNotificationSys.DrivePerfInfoChan(deadlinedCtx)
+			for obd := range driveInfos {
+				healthInfo.Perf.DriveInfo = append(healthInfo.Perf.DriveInfo, obd)
+				partialWrite(healthInfo)
 			}
-			partialWrite(obdInfo)
+			partialWrite(healthInfo)
 		}
 
 		if net := query.Get("perfnet"); net == "true" && globalIsDistErasure {
-			obdInfo.Perf.Net = append(obdInfo.Perf.Net, globalNotificationSys.NetOBDInfo(deadlinedCtx))
-			partialWrite(obdInfo)
+			healthInfo.Perf.Net = append(healthInfo.Perf.Net, globalNotificationSys.NetInfo(deadlinedCtx))
+			partialWrite(healthInfo)
 
-			netOBDs := globalNotificationSys.DispatchNetOBDChan(deadlinedCtx)
-			for obd := range netOBDs {
-				obdInfo.Perf.Net = append(obdInfo.Perf.Net, obd)
-				partialWrite(obdInfo)
+			netInfos := globalNotificationSys.DispatchNetPerfChan(deadlinedCtx)
+			for netInfo := range netInfos {
+				healthInfo.Perf.Net = append(healthInfo.Perf.Net, netInfo)
+				partialWrite(healthInfo)
 			}
-			partialWrite(obdInfo)
+			partialWrite(healthInfo)
 
-			obdInfo.Perf.NetParallel = globalNotificationSys.NetOBDParallelInfo(deadlinedCtx)
-			partialWrite(obdInfo)
+			healthInfo.Perf.NetParallel = globalNotificationSys.NetPerfParallelInfo(deadlinedCtx)
+			partialWrite(healthInfo)
 		}
 
 	}()
 
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case oinfo, ok := <-obdInfoCh:
+		case oinfo, ok := <-healthInfoCh:
 			if !ok {
 				return
 			}
@@ -1425,129 +1507,159 @@ func (a adminAPIHandlers) OBDInfoHandler(w http.ResponseWriter, r *http.Request)
 
 }
 
+// BandwidthMonitorHandler - GET /minio/admin/v3/bandwidth
+// ----------
+// Get bandwidth consumption information
+func (a adminAPIHandlers) BandwidthMonitorHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := newContext(r, w, "BandwidthMonitor")
+
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+
+	// Validate request signature.
+	_, adminAPIErr := checkAdminRequestAuth(ctx, r, iampolicy.BandwidthMonitorAction, "")
+	if adminAPIErr != ErrNone {
+		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(adminAPIErr), r.URL)
+		return
+	}
+
+	setEventStreamHeaders(w)
+	reportCh := make(chan bandwidth.Report, 1)
+	keepAliveTicker := time.NewTicker(500 * time.Millisecond)
+	defer keepAliveTicker.Stop()
+	bucketsRequestedString := r.URL.Query().Get("buckets")
+	bucketsRequested := strings.Split(bucketsRequestedString, ",")
+	go func() {
+		for {
+			reportCh <- globalNotificationSys.GetBandwidthReports(ctx, bucketsRequested...)
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				time.Sleep(2 * time.Second)
+			}
+		}
+	}()
+	for {
+		select {
+		case report := <-reportCh:
+			enc := json.NewEncoder(w)
+			err := enc.Encode(report)
+			if err != nil {
+				writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrInternalError), r.URL)
+				return
+			}
+			w.(http.Flusher).Flush()
+		case <-keepAliveTicker.C:
+			if _, err := w.Write([]byte(" ")); err != nil {
+				return
+			}
+			w.(http.Flusher).Flush()
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
 // ServerInfoHandler - GET /minio/admin/v3/info
 // ----------
 // Get server information
 func (a adminAPIHandlers) ServerInfoHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, w, "ServerInfo")
 
-	defer logger.AuditLog(w, r, "ServerInfo", mustGetClaimsFromToken(r))
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 
-	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.ServerInfoAdminAction)
-	if objectAPI == nil {
+	// Validate request signature.
+	_, adminAPIErr := checkAdminRequestAuth(ctx, r, iampolicy.ServerInfoAdminAction, "")
+	if adminAPIErr != ErrNone {
+		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(adminAPIErr), r.URL)
 		return
 	}
 
-	cfg, err := readServerConfig(ctx, objectAPI)
-	if err != nil {
-		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
-		return
-	}
-
-	buckets := madmin.Buckets{}
-	objects := madmin.Objects{}
-	usage := madmin.Usage{}
-
-	dataUsageInfo, err := loadDataUsageFromBackend(ctx, objectAPI)
-	if err == nil {
-		buckets = madmin.Buckets{Count: dataUsageInfo.BucketsCount}
-		objects = madmin.Objects{Count: dataUsageInfo.ObjectsTotalCount}
-		usage = madmin.Usage{Size: dataUsageInfo.ObjectsTotalSize}
-	}
-
-	vault := fetchVaultStatus(cfg)
+	kmsStat := fetchKMSStatus()
 
 	ldap := madmin.LDAP{}
 	if globalLDAPConfig.Enabled {
 		ldapConn, err := globalLDAPConfig.Connect()
 		if err != nil {
-			ldap.Status = "offline"
+			ldap.Status = string(madmin.ItemOffline)
 		} else if ldapConn == nil {
 			ldap.Status = "Not Configured"
 		} else {
 			// Close ldap connection to avoid leaks.
 			ldapConn.Close()
-			ldap.Status = "online"
+			ldap.Status = string(madmin.ItemOnline)
 		}
 	}
 
-	log, audit := fetchLoggerInfo(cfg)
+	log, audit := fetchLoggerInfo()
 
 	// Get the notification target info
-	notifyTarget := fetchLambdaInfo(cfg)
+	notifyTarget := fetchLambdaInfo()
 
-	// Fetching the Storage information, ignore any errors.
-	storageInfo, _ := objectAPI.StorageInfo(ctx, false)
+	local := getLocalServerProperty(globalEndpoints, r)
+	servers := globalNotificationSys.ServerInfo()
+	servers = append(servers, local)
+
+	assignPoolNumbers(servers)
 
 	var backend interface{}
-	if storageInfo.Backend.Type == BackendType(madmin.Erasure) {
-		backend = madmin.ErasureBackend{
-			Type:             madmin.ErasureType,
-			OnlineDisks:      storageInfo.Backend.OnlineDisks.Sum(),
-			OfflineDisks:     storageInfo.Backend.OfflineDisks.Sum(),
-			StandardSCData:   storageInfo.Backend.StandardSCData,
-			StandardSCParity: storageInfo.Backend.StandardSCParity,
-			RRSCData:         storageInfo.Backend.RRSCData,
-			RRSCParity:       storageInfo.Backend.RRSCParity,
+	mode := madmin.ItemInitializing
+
+	buckets := madmin.Buckets{}
+	objects := madmin.Objects{}
+	usage := madmin.Usage{}
+
+	objectAPI := newObjectLayerFn()
+	if objectAPI != nil {
+		mode = madmin.ItemOnline
+
+		// Load data usage
+		dataUsageInfo, err := loadDataUsageFromBackend(ctx, objectAPI)
+		if err == nil {
+			buckets = madmin.Buckets{Count: dataUsageInfo.BucketsCount}
+			objects = madmin.Objects{Count: dataUsageInfo.ObjectsTotalCount}
+			usage = madmin.Usage{Size: dataUsageInfo.ObjectsTotalSize}
+		} else {
+			buckets = madmin.Buckets{Error: err.Error()}
+			objects = madmin.Objects{Error: err.Error()}
+			usage = madmin.Usage{Error: err.Error()}
 		}
-	} else {
-		backend = madmin.FSBackend{
-			Type: madmin.FsType,
+
+		// Fetching the backend information
+		backendInfo := objectAPI.BackendInfo()
+		if backendInfo.Type == madmin.Erasure {
+			// Calculate the number of online/offline disks of all nodes
+			var allDisks []madmin.Disk
+			for _, s := range servers {
+				allDisks = append(allDisks, s.Disks...)
+			}
+			onlineDisks, offlineDisks := getOnlineOfflineDisksStats(allDisks)
+
+			backend = madmin.ErasureBackend{
+				Type:             madmin.ErasureType,
+				OnlineDisks:      onlineDisks.Sum(),
+				OfflineDisks:     offlineDisks.Sum(),
+				StandardSCParity: backendInfo.StandardSCParity,
+				RRSCParity:       backendInfo.RRSCParity,
+			}
+		} else {
+			backend = madmin.FSBackend{
+				Type: madmin.FsType,
+			}
 		}
 	}
-
-	mode := "safemode"
-	if newObjectLayerFn() != nil {
-		mode = "online"
-	}
-
-	server := getLocalServerProperty(globalEndpoints, r)
-	servers := globalNotificationSys.ServerInfo()
-	servers = append(servers, server)
 
 	domain := globalDomainNames
 	services := madmin.Services{
-		Vault:         vault,
+		KMS:           kmsStat,
 		LDAP:          ldap,
 		Logger:        log,
 		Audit:         audit,
 		Notifications: notifyTarget,
 	}
 
-	// Collect any disk healing.
-	healing, _ := getAggregatedBackgroundHealState(ctx)
-	healDisks := make(map[string]struct{}, len(healing.HealDisks))
-	for _, disk := range healing.HealDisks {
-		healDisks[disk] = struct{}{}
-	}
-
-	// find all disks which belong to each respective endpoints
-	for i := range servers {
-		for _, disk := range storageInfo.Disks {
-			if strings.Contains(disk.Endpoint, servers[i].Endpoint) {
-				if _, ok := healDisks[disk.Endpoint]; ok {
-					disk.Healing = true
-				}
-				servers[i].Disks = append(servers[i].Disks, disk)
-			}
-		}
-	}
-
-	// add all the disks local to this server.
-	for _, disk := range storageInfo.Disks {
-		if disk.DrivePath == "" && disk.Endpoint == "" {
-			continue
-		}
-		if disk.Endpoint == disk.DrivePath {
-			if _, ok := healDisks[disk.Endpoint]; ok {
-				disk.Healing = true
-			}
-			servers[len(servers)-1].Disks = append(servers[len(servers)-1].Disks, disk)
-		}
-	}
-
 	infoMsg := madmin.InfoMessage{
-		Mode:         mode,
+		Mode:         string(mode),
 		Domain:       domain,
 		Region:       globalServerRegion,
 		SQSARN:       globalNotificationSys.GetARNList(false),
@@ -1567,37 +1679,57 @@ func (a adminAPIHandlers) ServerInfoHandler(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	//Reply with storage information (across nodes in a
+	// Reply with storage information (across nodes in a
 	// distributed setup) as json.
 	writeSuccessResponseJSON(w, jsonBytes)
 }
 
-func fetchLambdaInfo(cfg config.Config) []map[string][]madmin.TargetIDStatus {
-
-	// Fetch the configured targets
-	tr := NewGatewayHTTPTransport()
-	defer tr.CloseIdleConnections()
-	targetList, err := notify.FetchRegisteredTargets(GlobalContext, cfg, tr, true, false)
-	if err != nil && err != notify.ErrTargetsOffline {
-		logger.LogIf(GlobalContext, err)
-		return nil
+func assignPoolNumbers(servers []madmin.ServerProperties) {
+	for i := range servers {
+		for idx, ge := range globalEndpoints {
+			for _, endpoint := range ge.Endpoints {
+				if servers[i].Endpoint == endpoint.Host {
+					servers[i].PoolNumber = idx + 1
+				} else if host, err := xnet.ParseHost(servers[i].Endpoint); err == nil {
+					if host.Name == endpoint.Hostname() {
+						servers[i].PoolNumber = idx + 1
+					}
+				}
+			}
+		}
 	}
+}
+
+func fetchLambdaInfo() []map[string][]madmin.TargetIDStatus {
 
 	lambdaMap := make(map[string][]madmin.TargetIDStatus)
 
-	for targetID, target := range targetList.TargetMap() {
+	for _, tgt := range globalConfigTargetList.Targets() {
 		targetIDStatus := make(map[string]madmin.Status)
-		active, _ := target.IsActive()
+		active, _ := tgt.IsActive()
+		targetID := tgt.ID()
 		if active {
-			targetIDStatus[targetID.ID] = madmin.Status{Status: "Online"}
+			targetIDStatus[targetID.ID] = madmin.Status{Status: string(madmin.ItemOnline)}
 		} else {
-			targetIDStatus[targetID.ID] = madmin.Status{Status: "Offline"}
+			targetIDStatus[targetID.ID] = madmin.Status{Status: string(madmin.ItemOffline)}
 		}
 		list := lambdaMap[targetID.Name]
 		list = append(list, targetIDStatus)
 		lambdaMap[targetID.Name] = list
-		// Close any leaking connections
-		_ = target.Close()
+	}
+
+	for _, tgt := range globalEnvTargetList.Targets() {
+		targetIDStatus := make(map[string]madmin.Status)
+		active, _ := tgt.IsActive()
+		targetID := tgt.ID()
+		if active {
+			targetIDStatus[targetID.ID] = madmin.Status{Status: string(madmin.ItemOnline)}
+		} else {
+			targetIDStatus[targetID.ID] = madmin.Status{Status: string(madmin.ItemOffline)}
+		}
+		list := lambdaMap[targetID.Name]
+		list = append(list, targetIDStatus)
+		lambdaMap[targetID.Name] = list
 	}
 
 	notify := make([]map[string][]madmin.TargetIDStatus, len(lambdaMap))
@@ -1611,85 +1743,85 @@ func fetchLambdaInfo(cfg config.Config) []map[string][]madmin.TargetIDStatus {
 	return notify
 }
 
-// fetchVaultStatus fetches Vault Info
-func fetchVaultStatus(cfg config.Config) madmin.Vault {
-	vault := madmin.Vault{}
+// fetchKMSStatus fetches KMS-related status information.
+func fetchKMSStatus() madmin.KMS {
+	kmsStat := madmin.KMS{}
 	if GlobalKMS == nil {
-		vault.Status = "disabled"
-		return vault
+		kmsStat.Status = "disabled"
+		return kmsStat
 	}
 	keyID := GlobalKMS.DefaultKeyID()
 	kmsInfo := GlobalKMS.Info()
-
 	if len(kmsInfo.Endpoints) == 0 {
-		vault.Status = "KMS configured using master key"
-		return vault
+		kmsStat.Status = "KMS configured using master key"
+		return kmsStat
 	}
 
 	if err := checkConnection(kmsInfo.Endpoints[0], 15*time.Second); err != nil {
-		vault.Status = "offline"
+		kmsStat.Status = string(madmin.ItemOffline)
 	} else {
-		vault.Status = "online"
+		kmsStat.Status = string(madmin.ItemOnline)
 
 		kmsContext := crypto.Context{"MinIO admin API": "ServerInfoHandler"} // Context for a test key operation
 		// 1. Generate a new key using the KMS.
 		key, sealedKey, err := GlobalKMS.GenerateKey(keyID, kmsContext)
 		if err != nil {
-			vault.Encrypt = fmt.Sprintf("Encryption failed: %v", err)
+			kmsStat.Encrypt = fmt.Sprintf("Encryption failed: %v", err)
 		} else {
-			vault.Encrypt = "Ok"
+			kmsStat.Encrypt = "success"
 		}
 
 		// 2. Verify that we can indeed decrypt the (encrypted) key
 		decryptedKey, err := GlobalKMS.UnsealKey(keyID, sealedKey, kmsContext)
 		switch {
 		case err != nil:
-			vault.Decrypt = fmt.Sprintf("Decryption failed: %v", err)
+			kmsStat.Decrypt = fmt.Sprintf("Decryption failed: %v", err)
 		case subtle.ConstantTimeCompare(key[:], decryptedKey[:]) != 1:
-			vault.Decrypt = "Decryption failed: decrypted key does not match generated key"
+			kmsStat.Decrypt = "Decryption failed: decrypted key does not match generated key"
 		default:
-			vault.Decrypt = "Ok"
+			kmsStat.Decrypt = "success"
 		}
 	}
-	return vault
+	return kmsStat
 }
 
 // fetchLoggerDetails return log info
-func fetchLoggerInfo(cfg config.Config) ([]madmin.Logger, []madmin.Audit) {
-	loggerCfg, _ := logger.LookupConfig(cfg)
-
-	var logger []madmin.Logger
-	var auditlogger []madmin.Audit
-	for log, l := range loggerCfg.HTTP {
-		if l.Enabled {
-			err := checkConnection(l.Endpoint, 15*time.Second)
+func fetchLoggerInfo() ([]madmin.Logger, []madmin.Audit) {
+	var loggerInfo []madmin.Logger
+	var auditloggerInfo []madmin.Audit
+	for _, target := range logger.Targets {
+		if target.Endpoint() != "" {
+			tgt := target.String()
+			err := checkConnection(target.Endpoint(), 15*time.Second)
 			if err == nil {
 				mapLog := make(map[string]madmin.Status)
-				mapLog[log] = madmin.Status{Status: "Online"}
-				logger = append(logger, mapLog)
+				mapLog[tgt] = madmin.Status{Status: string(madmin.ItemOnline)}
+				loggerInfo = append(loggerInfo, mapLog)
 			} else {
 				mapLog := make(map[string]madmin.Status)
-				mapLog[log] = madmin.Status{Status: "offline"}
-				logger = append(logger, mapLog)
+				mapLog[tgt] = madmin.Status{Status: string(madmin.ItemOffline)}
+				loggerInfo = append(loggerInfo, mapLog)
 			}
 		}
 	}
 
-	for audit, l := range loggerCfg.Audit {
-		if l.Enabled {
-			err := checkConnection(l.Endpoint, 15*time.Second)
+	for _, target := range logger.AuditTargets {
+		if target.Endpoint() != "" {
+			tgt := target.String()
+			err := checkConnection(target.Endpoint(), 15*time.Second)
 			if err == nil {
 				mapAudit := make(map[string]madmin.Status)
-				mapAudit[audit] = madmin.Status{Status: "Online"}
-				auditlogger = append(auditlogger, mapAudit)
+				mapAudit[tgt] = madmin.Status{Status: string(madmin.ItemOnline)}
+				auditloggerInfo = append(auditloggerInfo, mapAudit)
 			} else {
 				mapAudit := make(map[string]madmin.Status)
-				mapAudit[audit] = madmin.Status{Status: "Offline"}
-				auditlogger = append(auditlogger, mapAudit)
+				mapAudit[tgt] = madmin.Status{Status: string(madmin.ItemOffline)}
+				auditloggerInfo = append(auditloggerInfo, mapAudit)
 			}
 		}
 	}
-	return logger, auditlogger
+
+	return loggerInfo, auditloggerInfo
 }
 
 // checkConnection - ping an endpoint , return err in case of no connection

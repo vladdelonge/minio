@@ -34,6 +34,7 @@ import (
 	"encoding/pem"
 	"encoding/xml"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -53,19 +54,24 @@ import (
 	"time"
 
 	"github.com/fatih/color"
+
 	"github.com/gorilla/mux"
 	"github.com/minio/minio-go/v7/pkg/s3utils"
 	"github.com/minio/minio-go/v7/pkg/signer"
 	"github.com/minio/minio/cmd/config"
 	"github.com/minio/minio/cmd/crypto"
+	xhttp "github.com/minio/minio/cmd/http"
 	"github.com/minio/minio/cmd/logger"
+	"github.com/minio/minio/cmd/rest"
 	"github.com/minio/minio/pkg/auth"
 	"github.com/minio/minio/pkg/bucket/policy"
 	"github.com/minio/minio/pkg/hash"
 )
 
-// Tests should initNSLock only once.
-func init() {
+// TestMain to set up global env.
+func TestMain(m *testing.M) {
+	flag.Parse()
+
 	globalActiveCred = auth.Credentials{
 		AccessKey: auth.DefaultAccessKey,
 		SecretKey: auth.DefaultSecretKey,
@@ -88,8 +94,13 @@ func init() {
 	// Set as non-distributed.
 	globalIsDistErasure = false
 
-	// Disable printing console messages during tests.
-	color.Output = ioutil.Discard
+	if !testing.Verbose() {
+		// Disable printing console messages during tests.
+		color.Output = ioutil.Discard
+		logger.Disable = true
+	}
+	// Uncomment the following line to see trace logs during unit tests.
+	// logger.AddTarget(console.New())
 
 	// Set system resources to maximum.
 	setMaxResources()
@@ -97,16 +108,20 @@ func init() {
 	// Initialize globalConsoleSys system
 	globalConsoleSys = NewConsoleLogger(context.Background())
 
-	logger.Disable = true
+	globalDNSCache = xhttp.NewDNSCache(3*time.Second, 10*time.Second, logger.LogOnceIf)
+
+	globalInternodeTransport = newInternodeHTTPTransport(nil, rest.DefaultTimeout)()
 
 	initHelp()
 
 	resetTestGlobals()
-	// Uncomment the following line to see trace logs during unit tests.
-	// logger.AddTarget(console.New())
+
+	os.Setenv("MINIO_CI_CD", "ci")
+
+	os.Exit(m.Run())
 }
 
-// concurreny level for certain parallel tests.
+// concurrency level for certain parallel tests.
 const testConcurrencyLevel = 10
 
 ///
@@ -146,11 +161,11 @@ func calculateSignedChunkLength(chunkDataSize int64) int64 {
 }
 
 func mustGetPutObjReader(t TestErrHandler, data io.Reader, size int64, md5hex, sha256hex string) *PutObjReader {
-	hr, err := hash.NewReader(data, size, md5hex, sha256hex, size, globalCLIContext.StrictS3Compat)
+	hr, err := hash.NewReader(data, size, md5hex, sha256hex, size)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return NewPutObjReader(hr, nil, nil)
+	return NewPutObjReader(hr)
 }
 
 // calculateSignedChunkLength - calculates the length of the overall stream (data + metadata)
@@ -191,7 +206,7 @@ func prepareErasure(ctx context.Context, nDisks int) (ObjectLayer, []string, err
 	if err != nil {
 		return nil, nil, err
 	}
-	obj, _, err := initObjectLayer(ctx, mustGetZoneEndpoints(fsDirs...))
+	obj, _, err := initObjectLayer(ctx, mustGetPoolEndpoints(fsDirs...))
 	if err != nil {
 		removeRoots(fsDirs)
 		return nil, nil, err
@@ -219,13 +234,7 @@ func initFSObjects(disk string, t *testing.T) (obj ObjectLayer) {
 // Using this interface, functionalities to be used in tests can be
 // made generalized, and can be integrated in benchmarks/unit tests/go check suite tests.
 type TestErrHandler interface {
-	Log(args ...interface{})
-	Logf(format string, args ...interface{})
-	Error(args ...interface{})
-	Errorf(format string, args ...interface{})
-	Failed() bool
-	Fatal(args ...interface{})
-	Fatalf(format string, args ...interface{})
+	testing.TB
 }
 
 const (
@@ -286,7 +295,7 @@ func isSameType(obj1, obj2 interface{}) bool {
 //   defer s.Stop()
 type TestServer struct {
 	Root      string
-	Disks     EndpointZones
+	Disks     EndpointServerPools
 	AccessKey string
 	SecretKey string
 	Server    *httptest.Server
@@ -317,7 +326,7 @@ func UnstartedTestServer(t TestErrHandler, instanceType string) TestServer {
 	credentials := globalActiveCred
 
 	testServer.Obj = objLayer
-	testServer.Disks = mustGetZoneEndpoints(disks...)
+	testServer.Disks = mustGetPoolEndpoints(disks...)
 	testServer.AccessKey = credentials.AccessKey
 	testServer.SecretKey = credentials.SecretKey
 
@@ -403,7 +412,7 @@ func resetGlobalConfig() {
 }
 
 func resetGlobalEndpoints() {
-	globalEndpoints = EndpointZones{}
+	globalEndpoints = EndpointServerPools{}
 }
 
 func resetGlobalIsErasure() {
@@ -414,7 +423,7 @@ func resetGlobalIsErasure() {
 func resetGlobalHealState() {
 	// Init global heal state
 	if globalAllHealState == nil {
-		globalAllHealState = newHealState()
+		globalAllHealState = newHealState(false)
 	} else {
 		globalAllHealState.Lock()
 		for _, v := range globalAllHealState.healSeqMap {
@@ -427,7 +436,7 @@ func resetGlobalHealState() {
 
 	// Init background heal state
 	if globalBackgroundHealState == nil {
-		globalBackgroundHealState = newHealState()
+		globalBackgroundHealState = newHealState(false)
 	} else {
 		globalBackgroundHealState.Lock()
 		for _, v := range globalBackgroundHealState.healSeqMap {
@@ -1546,14 +1555,14 @@ func getRandomDisks(N int) ([]string, error) {
 }
 
 // Initialize object layer with the supplied disks, objectLayer is nil upon any error.
-func newTestObjectLayer(ctx context.Context, endpointZones EndpointZones) (newObject ObjectLayer, err error) {
+func newTestObjectLayer(ctx context.Context, endpointServerPools EndpointServerPools) (newObject ObjectLayer, err error) {
 	// For FS only, directly use the disk.
-	if endpointZones.NEndpoints() == 1 {
+	if endpointServerPools.NEndpoints() == 1 {
 		// Initialize new FS object layer.
-		return NewFSObjectLayer(endpointZones[0].Endpoints[0].Path)
+		return NewFSObjectLayer(endpointServerPools[0].Endpoints[0].Path)
 	}
 
-	z, err := newErasureZones(ctx, endpointZones)
+	z, err := newErasureServerPools(ctx, endpointServerPools)
 	if err != nil {
 		return nil, err
 	}
@@ -1566,16 +1575,16 @@ func newTestObjectLayer(ctx context.Context, endpointZones EndpointZones) (newOb
 }
 
 // initObjectLayer - Instantiates object layer and returns it.
-func initObjectLayer(ctx context.Context, endpointZones EndpointZones) (ObjectLayer, []StorageAPI, error) {
-	objLayer, err := newTestObjectLayer(ctx, endpointZones)
+func initObjectLayer(ctx context.Context, endpointServerPools EndpointServerPools) (ObjectLayer, []StorageAPI, error) {
+	objLayer, err := newTestObjectLayer(ctx, endpointServerPools)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	var formattedDisks []StorageAPI
 	// Should use the object layer tests for validating cache.
-	if z, ok := objLayer.(*erasureZones); ok {
-		formattedDisks = z.zones[0].GetDisks(0)()
+	if z, ok := objLayer.(*erasureServerPools); ok {
+		formattedDisks = z.serverPools[0].GetDisks(0)()
 	}
 
 	// Success.
@@ -1852,6 +1861,14 @@ func ExecObjectLayerAPITest(t *testing.T, objAPITest objAPITestType, endpoints [
 	removeRoots(append(erasureDisks, fsDir))
 }
 
+// ExecExtendedObjectLayerTest will execute the tests with combinations of encrypted & compressed.
+// This can be used to test functionality when reading and writing data.
+func ExecExtendedObjectLayerAPITest(t *testing.T, objAPITest objAPITestType, endpoints []string) {
+	execExtended(t, func(t *testing.T) {
+		ExecObjectLayerAPITest(t, objAPITest, endpoints)
+	})
+}
+
 // function to be passed to ExecObjectLayerAPITest, for executing object layr API handler tests.
 type objAPITestType func(obj ObjectLayer, instanceType string, bucketName string,
 	apiRouter http.Handler, credentials auth.Credentials, t *testing.T)
@@ -1871,10 +1888,16 @@ func ExecObjectLayerTest(t TestErrHandler, objTest objTestType) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	if localMetacacheMgr != nil {
+		localMetacacheMgr.deleteAll()
+	}
+	defer setObjectLayer(newObjectLayerFn())
+
 	objLayer, fsDir, err := prepareFS()
 	if err != nil {
 		t.Fatalf("Initialization of object layer failed for single node setup: %s", err)
 	}
+	setObjectLayer(objLayer)
 
 	newAllSubsystems()
 
@@ -1889,12 +1912,18 @@ func ExecObjectLayerTest(t TestErrHandler, objTest objTestType) {
 	// Executing the object layer tests for single node setup.
 	objTest(objLayer, FSTestStr, t)
 
-	newAllSubsystems()
+	if localMetacacheMgr != nil {
+		localMetacacheMgr.deleteAll()
+	}
+	defer setObjectLayer(newObjectLayerFn())
 
+	newAllSubsystems()
 	objLayer, fsDirs, err := prepareErasureSets32(ctx)
 	if err != nil {
 		t.Fatalf("Initialization of object layer failed for Erasure setup: %s", err)
 	}
+	setObjectLayer(objLayer)
+
 	defer objLayer.Shutdown(context.Background())
 
 	initAllSubsystems(ctx, objLayer)
@@ -1902,6 +1931,10 @@ func ExecObjectLayerTest(t TestErrHandler, objTest objTestType) {
 	defer removeRoots(append(fsDirs, fsDir))
 	// Executing the object layer tests for Erasure.
 	objTest(objLayer, ErasureTestStr, t)
+
+	if localMetacacheMgr != nil {
+		localMetacacheMgr.deleteAll()
+	}
 }
 
 // ExecObjectLayerTestWithDirs - executes object layer tests.
@@ -1962,7 +1995,7 @@ func ExecObjectLayerStaleFilesTest(t *testing.T, objTest objTestStaleFilesType) 
 	if err != nil {
 		t.Fatalf("Initialization of disks for Erasure setup: %s", err)
 	}
-	objLayer, _, err := initObjectLayer(ctx, mustGetZoneEndpoints(erasureDisks...))
+	objLayer, _, err := initObjectLayer(ctx, mustGetPoolEndpoints(erasureDisks...))
 	if err != nil {
 		t.Fatalf("Initialization of object layer failed for Erasure setup: %s", err)
 	}
@@ -2077,16 +2110,10 @@ func registerAPIFunctions(muxRouter *mux.Router, objLayer ObjectLayer, apiFuncti
 	// operation
 	api := objectAPIHandlers{
 		ObjectAPI: func() ObjectLayer {
-			if !globalSafeMode {
-				return globalObjectAPI
-			}
-			return nil
+			return globalObjectAPI
 		},
 		CacheAPI: func() CacheObjectLayer {
-			if !globalSafeMode {
-				return globalCacheObjectAPI
-			}
-			return nil
+			return globalCacheObjectAPI
 		},
 	}
 
@@ -2218,11 +2245,17 @@ func generateTLSCertKey(host string) ([]byte, []byte, error) {
 	return certOut.Bytes(), keyOut.Bytes(), nil
 }
 
-func mustGetZoneEndpoints(args ...string) EndpointZones {
+func mustGetPoolEndpoints(args ...string) EndpointServerPools {
 	endpoints := mustGetNewEndpoints(args...)
-	return []ZoneEndpoints{{
-		SetCount:     1,
-		DrivesPerSet: len(args),
+	drivesPerSet := len(args)
+	setCount := 1
+	if len(args) >= 16 {
+		drivesPerSet = 16
+		setCount = len(args) / 16
+	}
+	return []PoolEndpoints{{
+		SetCount:     setCount,
+		DrivesPerSet: drivesPerSet,
 		Endpoints:    endpoints,
 	}}
 }
@@ -2233,8 +2266,8 @@ func mustGetNewEndpoints(args ...string) (endpoints Endpoints) {
 	return endpoints
 }
 
-func getEndpointsLocalAddr(endpointZones EndpointZones) string {
-	for _, endpoints := range endpointZones {
+func getEndpointsLocalAddr(endpointServerPools EndpointServerPools) string {
+	for _, endpoints := range endpointServerPools {
 		for _, endpoint := range endpoints.Endpoints {
 			if endpoint.IsLocal && endpoint.Type() == URLEndpointType {
 				return endpoint.Host

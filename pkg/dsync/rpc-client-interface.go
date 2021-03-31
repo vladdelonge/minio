@@ -33,6 +33,9 @@ type LockArgs struct {
 	// Owner represents unique ID for this instance, an owner who originally requested
 	// the locked resource, useful primarily in figuring our stale locks.
 	Owner string
+
+	// Quorum represents the expected quorum for this lock type.
+	Quorum int
 }
 
 // NetLocker is dsync compatible locker interface.
@@ -57,8 +60,13 @@ type NetLocker interface {
 	// * an error on failure of unlock request operation.
 	Unlock(args LockArgs) (bool, error)
 
-	// Expired returns if current lock args has expired.
-	Expired(ctx context.Context, args LockArgs) (bool, error)
+	// Refresh the given lock to prevent it from becoming stale
+	Refresh(ctx context.Context, args LockArgs) (bool, error)
+
+	// Unlock (read/write) forcefully for given LockArgs. It should return
+	// * a boolean to indicate success/failure of the operation
+	// * an error on failure of unlock request operation.
+	ForceUnlock(ctx context.Context, args LockArgs) (bool, error)
 
 	// Returns underlying endpoint of this lock client instance.
 	String() string
@@ -68,4 +76,7 @@ type NetLocker interface {
 
 	// Is the underlying connection online? (is always true for any local lockers)
 	IsOnline() bool
+
+	// Is the underlying locker local to this server?
+	IsLocal() bool
 }

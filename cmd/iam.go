@@ -23,17 +23,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand"
 	"strings"
+	"sync"
 	"time"
 
 	humanize "github.com/dustin/go-humanize"
 	"github.com/minio/minio-go/v7/pkg/set"
-	"github.com/minio/minio/cmd/config"
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/auth"
 	iampolicy "github.com/minio/minio/pkg/iam/policy"
 	"github.com/minio/minio/pkg/madmin"
-	"github.com/minio/minio/pkg/retry"
 )
 
 // UsersSysType - defines the type of users and groups system that is
@@ -201,6 +201,8 @@ func newMappedPolicy(policy string) MappedPolicy {
 
 // IAMSys - config system.
 type IAMSys struct {
+	sync.Mutex
+
 	usersSysType UsersSysType
 
 	// map of policy names to policy definitions
@@ -217,8 +219,10 @@ type IAMSys struct {
 	iamGroupPolicyMap map[string]MappedPolicy
 
 	// Persistence layer for IAM subsystem
-	store         IAMStorageAPI
-	storeFallback bool
+	store IAMStorageAPI
+
+	// configLoaded will be closed and remain so after first load.
+	configLoaded chan struct{}
 }
 
 // IAMUserType represents a user type inside MinIO server
@@ -230,6 +234,11 @@ const (
 	srvAccUser
 )
 
+// key options
+type options struct {
+	ttl int64 //expiry in seconds
+}
+
 // IAMStorageAPI defines an interface for the IAM persistence layer
 type IAMStorageAPI interface {
 	lock()
@@ -240,33 +249,33 @@ type IAMStorageAPI interface {
 
 	migrateBackendFormat(context.Context) error
 
-	loadPolicyDoc(policy string, m map[string]iampolicy.Policy) error
+	loadPolicyDoc(ctx context.Context, policy string, m map[string]iampolicy.Policy) error
 	loadPolicyDocs(ctx context.Context, m map[string]iampolicy.Policy) error
 
-	loadUser(user string, userType IAMUserType, m map[string]auth.Credentials) error
+	loadUser(ctx context.Context, user string, userType IAMUserType, m map[string]auth.Credentials) error
 	loadUsers(ctx context.Context, userType IAMUserType, m map[string]auth.Credentials) error
 
-	loadGroup(group string, m map[string]GroupInfo) error
+	loadGroup(ctx context.Context, group string, m map[string]GroupInfo) error
 	loadGroups(ctx context.Context, m map[string]GroupInfo) error
 
-	loadMappedPolicy(name string, userType IAMUserType, isGroup bool, m map[string]MappedPolicy) error
+	loadMappedPolicy(ctx context.Context, name string, userType IAMUserType, isGroup bool, m map[string]MappedPolicy) error
 	loadMappedPolicies(ctx context.Context, userType IAMUserType, isGroup bool, m map[string]MappedPolicy) error
 
 	loadAll(context.Context, *IAMSys) error
 
-	saveIAMConfig(item interface{}, path string) error
-	loadIAMConfig(item interface{}, path string) error
-	deleteIAMConfig(path string) error
+	saveIAMConfig(ctx context.Context, item interface{}, path string, opts ...options) error
+	loadIAMConfig(ctx context.Context, item interface{}, path string) error
+	deleteIAMConfig(ctx context.Context, path string) error
 
-	savePolicyDoc(policyName string, p iampolicy.Policy) error
-	saveMappedPolicy(name string, userType IAMUserType, isGroup bool, mp MappedPolicy) error
-	saveUserIdentity(name string, userType IAMUserType, u UserIdentity) error
-	saveGroupInfo(group string, gi GroupInfo) error
+	savePolicyDoc(ctx context.Context, policyName string, p iampolicy.Policy) error
+	saveMappedPolicy(ctx context.Context, name string, userType IAMUserType, isGroup bool, mp MappedPolicy, opts ...options) error
+	saveUserIdentity(ctx context.Context, name string, userType IAMUserType, u UserIdentity, opts ...options) error
+	saveGroupInfo(ctx context.Context, group string, gi GroupInfo) error
 
-	deletePolicyDoc(policyName string) error
-	deleteMappedPolicy(name string, userType IAMUserType, isGroup bool) error
-	deleteUserIdentity(name string, userType IAMUserType) error
-	deleteGroupInfo(name string) error
+	deletePolicyDoc(ctx context.Context, policyName string) error
+	deleteMappedPolicy(ctx context.Context, name string, userType IAMUserType, isGroup bool) error
+	deleteUserIdentity(ctx context.Context, name string, userType IAMUserType) error
+	deleteGroupInfo(ctx context.Context, name string) error
 
 	watch(context.Context, *IAMSys)
 }
@@ -277,7 +286,7 @@ type IAMStorageAPI interface {
 // simplifies the implementation for group removal. This is called
 // only via IAM notifications.
 func (sys *IAMSys) LoadGroup(objAPI ObjectLayer, group string) error {
-	if objAPI == nil || sys == nil || sys.store == nil {
+	if !sys.Initialized() {
 		return errServerNotInitialized
 	}
 
@@ -289,7 +298,7 @@ func (sys *IAMSys) LoadGroup(objAPI ObjectLayer, group string) error {
 	sys.store.lock()
 	defer sys.store.unlock()
 
-	err := sys.store.loadGroup(group, sys.iamGroupsMap)
+	err := sys.store.loadGroup(context.Background(), group, sys.iamGroupsMap)
 	if err != nil && err != errNoSuchGroup {
 		return err
 	}
@@ -318,7 +327,7 @@ func (sys *IAMSys) LoadGroup(objAPI ObjectLayer, group string) error {
 
 // LoadPolicy - reloads a specific canned policy from backend disks or etcd.
 func (sys *IAMSys) LoadPolicy(objAPI ObjectLayer, policyName string) error {
-	if objAPI == nil || sys == nil || sys.store == nil {
+	if !sys.Initialized() {
 		return errServerNotInitialized
 	}
 
@@ -326,7 +335,7 @@ func (sys *IAMSys) LoadPolicy(objAPI ObjectLayer, policyName string) error {
 	defer sys.store.unlock()
 
 	if globalEtcdClient == nil {
-		return sys.store.loadPolicyDoc(policyName, sys.iamPolicyDocsMap)
+		return sys.store.loadPolicyDoc(context.Background(), policyName, sys.iamPolicyDocsMap)
 	}
 
 	// When etcd is set, we use watch APIs so this code is not needed.
@@ -336,7 +345,7 @@ func (sys *IAMSys) LoadPolicy(objAPI ObjectLayer, policyName string) error {
 // LoadPolicyMapping - loads the mapped policy for a user or group
 // from storage into server memory.
 func (sys *IAMSys) LoadPolicyMapping(objAPI ObjectLayer, userOrGroup string, isGroup bool) error {
-	if objAPI == nil || sys == nil || sys.store == nil {
+	if !sys.Initialized() {
 		return errServerNotInitialized
 	}
 
@@ -346,9 +355,9 @@ func (sys *IAMSys) LoadPolicyMapping(objAPI ObjectLayer, userOrGroup string, isG
 	if globalEtcdClient == nil {
 		var err error
 		if isGroup {
-			err = sys.store.loadMappedPolicy(userOrGroup, regularUser, isGroup, sys.iamGroupPolicyMap)
+			err = sys.store.loadMappedPolicy(context.Background(), userOrGroup, regularUser, isGroup, sys.iamGroupPolicyMap)
 		} else {
-			err = sys.store.loadMappedPolicy(userOrGroup, regularUser, isGroup, sys.iamUserPolicyMap)
+			err = sys.store.loadMappedPolicy(context.Background(), userOrGroup, regularUser, isGroup, sys.iamUserPolicyMap)
 		}
 
 		// Ignore policy not mapped error
@@ -362,7 +371,7 @@ func (sys *IAMSys) LoadPolicyMapping(objAPI ObjectLayer, userOrGroup string, isG
 
 // LoadUser - reloads a specific user from backend disks or etcd.
 func (sys *IAMSys) LoadUser(objAPI ObjectLayer, accessKey string, userType IAMUserType) error {
-	if objAPI == nil || sys == nil || sys.store == nil {
+	if !sys.Initialized() {
 		return errServerNotInitialized
 	}
 
@@ -370,11 +379,11 @@ func (sys *IAMSys) LoadUser(objAPI ObjectLayer, accessKey string, userType IAMUs
 	defer sys.store.unlock()
 
 	if globalEtcdClient == nil {
-		err := sys.store.loadUser(accessKey, userType, sys.iamUsersMap)
+		err := sys.store.loadUser(context.Background(), accessKey, userType, sys.iamUsersMap)
 		if err != nil {
 			return err
 		}
-		err = sys.store.loadMappedPolicy(accessKey, userType, false, sys.iamUserPolicyMap)
+		err = sys.store.loadMappedPolicy(context.Background(), accessKey, userType, false, sys.iamUserPolicyMap)
 		// Ignore policy not mapped error
 		if err != nil && err != errNoSuchPolicy {
 			return err
@@ -386,7 +395,7 @@ func (sys *IAMSys) LoadUser(objAPI ObjectLayer, accessKey string, userType IAMUs
 
 // LoadServiceAccount - reloads a specific service account from backend disks or etcd.
 func (sys *IAMSys) LoadServiceAccount(accessKey string) error {
-	if sys == nil || sys.store == nil {
+	if !sys.Initialized() {
 		return errServerNotInitialized
 	}
 
@@ -394,7 +403,7 @@ func (sys *IAMSys) LoadServiceAccount(accessKey string) error {
 	defer sys.store.unlock()
 
 	if globalEtcdClient == nil {
-		err := sys.store.loadUser(accessKey, srvAccUser, sys.iamUsersMap)
+		err := sys.store.loadUser(context.Background(), accessKey, srvAccUser, sys.iamUsersMap)
 		if err != nil {
 			return err
 		}
@@ -408,29 +417,156 @@ func (sys *IAMSys) doIAMConfigMigration(ctx context.Context) error {
 	return sys.store.migrateBackendFormat(ctx)
 }
 
-// Loads IAM users and policies in background, any un-handled
-// error means this code can potentially crash the server
-// in such a situation manual intervention is necessary.
-func startBackgroundIAMLoad(ctx context.Context) {
-	go globalIAMSys.Init(ctx, newObjectLayerWithoutSafeModeFn())
-}
-
-// Init - initializes config system by reading entries from config/iam
-func (sys *IAMSys) Init(ctx context.Context, objAPI ObjectLayer) {
-	if objAPI == nil {
-		logger.LogIf(ctx, errServerNotInitialized)
-		return
-	}
+// InitStore initializes IAM stores
+func (sys *IAMSys) InitStore(objAPI ObjectLayer) {
+	sys.Lock()
+	defer sys.Unlock()
 
 	if globalEtcdClient == nil {
-		sys.store = newIAMObjectStore(ctx, objAPI)
+		sys.store = newIAMObjectStore(objAPI)
 	} else {
-		sys.store = newIAMEtcdStore(ctx)
+		sys.store = newIAMEtcdStore()
 	}
 
 	if globalLDAPConfig.Enabled {
 		sys.EnableLDAPSys()
 	}
+}
+
+// Initialized check if IAM is initialized
+func (sys *IAMSys) Initialized() bool {
+	if sys == nil {
+		return false
+	}
+	sys.Lock()
+	defer sys.Unlock()
+	return sys.store != nil
+}
+
+// Load - loads all credentials
+func (sys *IAMSys) Load(ctx context.Context, store IAMStorageAPI) error {
+	iamUsersMap := make(map[string]auth.Credentials)
+	iamGroupsMap := make(map[string]GroupInfo)
+	iamUserPolicyMap := make(map[string]MappedPolicy)
+	iamGroupPolicyMap := make(map[string]MappedPolicy)
+	iamPolicyDocsMap := make(map[string]iampolicy.Policy)
+
+	store.rlock()
+	isMinIOUsersSys := sys.usersSysType == MinIOUsersSysType
+	store.runlock()
+
+	if err := store.loadPolicyDocs(ctx, iamPolicyDocsMap); err != nil {
+		return err
+	}
+
+	// Sets default canned policies, if none are set.
+	setDefaultCannedPolicies(iamPolicyDocsMap)
+
+	if isMinIOUsersSys {
+		if err := store.loadUsers(ctx, regularUser, iamUsersMap); err != nil {
+			return err
+		}
+		if err := store.loadGroups(ctx, iamGroupsMap); err != nil {
+			return err
+		}
+	}
+
+	// load polices mapped to users
+	if err := store.loadMappedPolicies(ctx, regularUser, false, iamUserPolicyMap); err != nil {
+		return err
+	}
+
+	// load policies mapped to groups
+	if err := store.loadMappedPolicies(ctx, regularUser, true, iamGroupPolicyMap); err != nil {
+		return err
+	}
+
+	if err := store.loadUsers(ctx, srvAccUser, iamUsersMap); err != nil {
+		return err
+	}
+
+	// load STS temp users
+	if err := store.loadUsers(ctx, stsUser, iamUsersMap); err != nil {
+		return err
+	}
+
+	// load STS policy mappings
+	if err := store.loadMappedPolicies(ctx, stsUser, false, iamUserPolicyMap); err != nil {
+		return err
+	}
+
+	store.lock()
+	defer store.unlock()
+
+	for k, v := range iamPolicyDocsMap {
+		sys.iamPolicyDocsMap[k] = v
+	}
+
+	// Merge the new reloaded entries into global map.
+	// See issue https://github.com/minio/minio/issues/9651
+	// where the present list of entries on disk are not yet
+	// latest, there is a small window where this can make
+	// valid users invalid.
+	for k, v := range iamUsersMap {
+		sys.iamUsersMap[k] = v
+	}
+
+	for k, v := range iamUserPolicyMap {
+		sys.iamUserPolicyMap[k] = v
+	}
+
+	// purge any expired entries which became expired now.
+	var expiredEntries []string
+	for k, v := range sys.iamUsersMap {
+		if v.IsExpired() {
+			delete(sys.iamUsersMap, k)
+			delete(sys.iamUserPolicyMap, k)
+			expiredEntries = append(expiredEntries, k)
+			// Deleting on the disk is taken care of in the next cycle
+		}
+	}
+
+	for _, v := range sys.iamUsersMap {
+		if v.IsServiceAccount() {
+			for _, accessKey := range expiredEntries {
+				if v.ParentUser == accessKey {
+					_ = store.deleteUserIdentity(ctx, v.AccessKey, srvAccUser)
+					delete(sys.iamUsersMap, v.AccessKey)
+				}
+			}
+		}
+	}
+
+	// purge any expired entries which became expired now.
+	for k, v := range sys.iamUsersMap {
+		if v.IsExpired() {
+			delete(sys.iamUsersMap, k)
+			delete(sys.iamUserPolicyMap, k)
+			// Deleting on the etcd is taken care of in the next cycle
+		}
+	}
+
+	for k, v := range iamGroupPolicyMap {
+		sys.iamGroupPolicyMap[k] = v
+	}
+
+	for k, v := range iamGroupsMap {
+		sys.iamGroupsMap[k] = v
+	}
+
+	sys.buildUserGroupMemberships()
+	select {
+	case <-sys.configLoaded:
+	default:
+		close(sys.configLoaded)
+	}
+	return nil
+}
+
+// Init - initializes config system by reading entries from config/iam
+func (sys *IAMSys) Init(ctx context.Context, objAPI ObjectLayer) {
+	// Initialize IAM store
+	sys.InitStore(objAPI)
 
 	retryCtx, cancel := context.WithCancel(ctx)
 
@@ -438,25 +574,19 @@ func (sys *IAMSys) Init(ctx context.Context, objAPI ObjectLayer) {
 	defer cancel()
 
 	// Hold the lock for migration only.
-	txnLk := objAPI.NewNSLock(retryCtx, minioMetaBucket, minioConfigPrefix+"/iam.lock")
-
-	// Initializing IAM sub-system needs a retry mechanism for
-	// the following reasons:
-	//  - Read quorum is lost just after the initialization
-	//    of the object layer.
-	//  - Write quorum not met when upgrading configuration
-	//    version is needed, migration is needed etc.
-	rquorum := InsufficientReadQuorum{}
-	wquorum := InsufficientWriteQuorum{}
+	txnLk := objAPI.NewNSLock(minioMetaBucket, minioConfigPrefix+"/iam.lock")
 
 	// allocate dynamic timeout once before the loop
 	iamLockTimeout := newDynamicTimeout(5*time.Second, 3*time.Second)
 
-	for range retry.NewTimerWithJitter(retryCtx, time.Second, 5*time.Second, retry.MaxJitter) {
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+
+	for {
 		// let one of the server acquire the lock, if not let them timeout.
 		// which shall be retried again by this loop.
-		if err := txnLk.GetLock(iamLockTimeout); err != nil {
+		if _, err := txnLk.GetLock(retryCtx, iamLockTimeout); err != nil {
 			logger.Info("Waiting for all MinIO IAM sub-system to be initialized.. trying to acquire lock")
+			time.Sleep(time.Duration(r.Float64() * float64(5*time.Second)))
 			continue
 		}
 
@@ -480,13 +610,7 @@ func (sys *IAMSys) Init(ctx context.Context, objAPI ObjectLayer) {
 		// Migrate IAM configuration, if necessary.
 		if err := sys.doIAMConfigMigration(ctx); err != nil {
 			txnLk.Unlock()
-			if errors.Is(err, errDiskNotFound) ||
-				errors.Is(err, errConfigNotFound) ||
-				errors.Is(err, context.Canceled) ||
-				errors.Is(err, context.DeadlineExceeded) ||
-				errors.As(err, &rquorum) ||
-				errors.As(err, &wquorum) ||
-				isErrBucketNotFound(err) {
+			if configRetriableErrors(err) {
 				logger.Info("Waiting for all MinIO IAM sub-system to be initialized.. possible cause (%v)", err)
 				continue
 			}
@@ -500,22 +624,30 @@ func (sys *IAMSys) Init(ctx context.Context, objAPI ObjectLayer) {
 		break
 	}
 
-	err := sys.store.loadAll(ctx, sys)
+	for {
+		if err := sys.store.loadAll(ctx, sys); err != nil {
+			if configRetriableErrors(err) {
+				logger.Info("Waiting for all MinIO IAM sub-system to be initialized.. possible cause (%v)", err)
+				time.Sleep(time.Duration(r.Float64() * float64(5*time.Second)))
+				continue
+			}
+			if err != nil {
+				logger.LogIf(ctx, fmt.Errorf("Unable to initialize IAM sub-system, some users may not be available %w", err))
+			}
+		}
+		break
+	}
 
 	// Invalidate the old cred always, even upon error to avoid any leakage.
 	globalOldCred = auth.Credentials{}
-
-	if err != nil {
-		logger.LogIf(ctx, fmt.Errorf("Unable to initialize IAM sub-system, some users may not be available %w", err))
-	}
-
 	go sys.store.watch(ctx, sys)
+
+	logger.Info("IAM initialization complete")
 }
 
 // DeletePolicy - deletes a canned policy from backend or etcd.
 func (sys *IAMSys) DeletePolicy(policyName string) error {
-	objectAPI := newObjectLayerWithoutSafeModeFn()
-	if objectAPI == nil || sys == nil || sys.store == nil {
+	if !sys.Initialized() {
 		return errServerNotInitialized
 	}
 
@@ -526,7 +658,7 @@ func (sys *IAMSys) DeletePolicy(policyName string) error {
 	sys.store.lock()
 	defer sys.store.unlock()
 
-	err := sys.store.deletePolicyDoc(policyName)
+	err := sys.store.deletePolicyDoc(context.Background(), policyName)
 	if err == errNoSuchPolicy {
 		// Ignore error if policy is already deleted.
 		err = nil
@@ -567,8 +699,7 @@ func (sys *IAMSys) DeletePolicy(policyName string) error {
 
 // InfoPolicy - expands the canned policy into its JSON structure.
 func (sys *IAMSys) InfoPolicy(policyName string) (iampolicy.Policy, error) {
-	objectAPI := newObjectLayerWithoutSafeModeFn()
-	if objectAPI == nil || sys == nil || sys.store == nil {
+	if !sys.Initialized() {
 		return iampolicy.Policy{}, errServerNotInitialized
 	}
 
@@ -585,17 +716,14 @@ func (sys *IAMSys) InfoPolicy(policyName string) (iampolicy.Policy, error) {
 
 // ListPolicies - lists all canned policies.
 func (sys *IAMSys) ListPolicies() (map[string]iampolicy.Policy, error) {
-	objectAPI := newObjectLayerWithoutSafeModeFn()
-	if objectAPI == nil || sys == nil || sys.store == nil {
+	if !sys.Initialized() {
 		return nil, errServerNotInitialized
 	}
 
+	<-sys.configLoaded
+
 	sys.store.rlock()
 	defer sys.store.runlock()
-
-	if sys.storeFallback {
-		return nil, errIAMNotInitialized
-	}
 
 	policyDocsMap := make(map[string]iampolicy.Policy, len(sys.iamPolicyDocsMap))
 	for k, v := range sys.iamPolicyDocsMap {
@@ -607,8 +735,7 @@ func (sys *IAMSys) ListPolicies() (map[string]iampolicy.Policy, error) {
 
 // SetPolicy - sets a new name policy.
 func (sys *IAMSys) SetPolicy(policyName string, p iampolicy.Policy) error {
-	objectAPI := newObjectLayerWithoutSafeModeFn()
-	if objectAPI == nil || sys == nil || sys.store == nil {
+	if !sys.Initialized() {
 		return errServerNotInitialized
 	}
 
@@ -619,7 +746,7 @@ func (sys *IAMSys) SetPolicy(policyName string, p iampolicy.Policy) error {
 	sys.store.lock()
 	defer sys.store.unlock()
 
-	if err := sys.store.savePolicyDoc(policyName, p); err != nil {
+	if err := sys.store.savePolicyDoc(context.Background(), policyName, p); err != nil {
 		return err
 	}
 
@@ -629,9 +756,12 @@ func (sys *IAMSys) SetPolicy(policyName string, p iampolicy.Policy) error {
 
 // DeleteUser - delete user (only for long-term users not STS users).
 func (sys *IAMSys) DeleteUser(accessKey string) error {
-	objectAPI := newObjectLayerWithoutSafeModeFn()
-	if objectAPI == nil || sys == nil || sys.store == nil {
+	if !sys.Initialized() {
 		return errServerNotInitialized
+	}
+
+	if sys.usersSysType != MinIOUsersSysType {
+		return errIAMActionNotAllowed
 	}
 
 	// First we remove the user from their groups.
@@ -651,23 +781,26 @@ func (sys *IAMSys) DeleteUser(accessKey string) error {
 	sys.store.lock()
 	defer sys.store.unlock()
 
-	if sys.usersSysType != MinIOUsersSysType {
-		return errIAMActionNotAllowed
-	}
-
-	// Delete any service accounts if any first.
 	for _, u := range sys.iamUsersMap {
+		// Delete any service accounts if any first.
 		if u.IsServiceAccount() {
 			if u.ParentUser == accessKey {
-				_ = sys.store.deleteUserIdentity(u.AccessKey, srvAccUser)
+				_ = sys.store.deleteUserIdentity(context.Background(), u.AccessKey, srvAccUser)
+				delete(sys.iamUsersMap, u.AccessKey)
+			}
+		}
+		// Delete any associated STS users.
+		if u.IsTemp() {
+			if u.ParentUser == accessKey {
+				_ = sys.store.deleteUserIdentity(context.Background(), u.AccessKey, stsUser)
 				delete(sys.iamUsersMap, u.AccessKey)
 			}
 		}
 	}
 
 	// It is ok to ignore deletion error on the mapped policy
-	sys.store.deleteMappedPolicy(accessKey, regularUser, false)
-	err := sys.store.deleteUserIdentity(accessKey, regularUser)
+	sys.store.deleteMappedPolicy(context.Background(), accessKey, regularUser, false)
+	err := sys.store.deleteUserIdentity(context.Background(), accessKey, regularUser)
 	if err == errNoSuchUser {
 		// ignore if user is already deleted.
 		err = nil
@@ -679,10 +812,14 @@ func (sys *IAMSys) DeleteUser(accessKey string) error {
 	return err
 }
 
-// returns comma separated policy string, from an input policy
-// after validating if there are any current policies which exist
-// on MinIO corresponding to the input.
-func (sys *IAMSys) currentPolicies(policyName string) string {
+// CurrentPolicies - returns comma separated policy string, from
+// an input policy after validating if there are any current
+// policies which exist on MinIO corresponding to the input.
+func (sys *IAMSys) CurrentPolicies(policyName string) string {
+	if !sys.Initialized() {
+		return ""
+	}
+
 	sys.store.rlock()
 	defer sys.store.runlock()
 
@@ -699,13 +836,14 @@ func (sys *IAMSys) currentPolicies(policyName string) string {
 
 // SetTempUser - set temporary user credentials, these credentials have an expiry.
 func (sys *IAMSys) SetTempUser(accessKey string, cred auth.Credentials, policyName string) error {
-	objectAPI := newObjectLayerWithoutSafeModeFn()
-	if objectAPI == nil || sys == nil || sys.store == nil {
+	if !sys.Initialized() {
 		return errServerNotInitialized
 	}
 
 	sys.store.lock()
 	defer sys.store.unlock()
+
+	ttl := int64(cred.Expiration.Sub(UTCNow()).Seconds())
 
 	// If OPA is not set we honor any policy claims for this
 	// temporary user which match with pre-configured canned
@@ -731,7 +869,7 @@ func (sys *IAMSys) SetTempUser(accessKey string, cred auth.Credentials, policyNa
 			return nil
 		}
 
-		if err := sys.store.saveMappedPolicy(accessKey, stsUser, false, mp); err != nil {
+		if err := sys.store.saveMappedPolicy(context.Background(), accessKey, stsUser, false, mp, options{ttl: ttl}); err != nil {
 			return err
 		}
 
@@ -739,7 +877,7 @@ func (sys *IAMSys) SetTempUser(accessKey string, cred auth.Credentials, policyNa
 	}
 
 	u := newUserIdentity(cred)
-	if err := sys.store.saveUserIdentity(accessKey, stsUser, u); err != nil {
+	if err := sys.store.saveUserIdentity(context.Background(), accessKey, stsUser, u, options{ttl: ttl}); err != nil {
 		return err
 	}
 
@@ -749,23 +887,20 @@ func (sys *IAMSys) SetTempUser(accessKey string, cred auth.Credentials, policyNa
 
 // ListUsers - list all users.
 func (sys *IAMSys) ListUsers() (map[string]madmin.UserInfo, error) {
-	objectAPI := newObjectLayerWithoutSafeModeFn()
-	if objectAPI == nil || sys == nil || sys.store == nil {
+	if !sys.Initialized() {
 		return nil, errServerNotInitialized
 	}
-
-	var users = make(map[string]madmin.UserInfo)
-
-	sys.store.rlock()
-	defer sys.store.runlock()
 
 	if sys.usersSysType != MinIOUsersSysType {
 		return nil, errIAMActionNotAllowed
 	}
 
-	if sys.storeFallback {
-		return nil, errIAMNotInitialized
-	}
+	<-sys.configLoaded
+
+	sys.store.rlock()
+	defer sys.store.runlock()
+
+	var users = make(map[string]madmin.UserInfo)
 
 	for k, v := range sys.iamUsersMap {
 		if !v.IsTemp() && !v.IsServiceAccount() {
@@ -785,10 +920,9 @@ func (sys *IAMSys) ListUsers() (map[string]madmin.UserInfo, error) {
 }
 
 // IsTempUser - returns if given key is a temporary user.
-func (sys *IAMSys) IsTempUser(name string) (bool, error) {
-	objectAPI := newObjectLayerWithoutSafeModeFn()
-	if objectAPI == nil || sys == nil || sys.store == nil {
-		return false, errServerNotInitialized
+func (sys *IAMSys) IsTempUser(name string) (bool, string, error) {
+	if !sys.Initialized() {
+		return false, "", errServerNotInitialized
 	}
 
 	sys.store.rlock()
@@ -796,16 +930,19 @@ func (sys *IAMSys) IsTempUser(name string) (bool, error) {
 
 	cred, found := sys.iamUsersMap[name]
 	if !found {
-		return false, errNoSuchUser
+		return false, "", errNoSuchUser
 	}
 
-	return cred.IsTemp(), nil
+	if cred.IsTemp() {
+		return true, cred.ParentUser, nil
+	}
+
+	return false, "", nil
 }
 
 // IsServiceAccount - returns if given key is a service account
 func (sys *IAMSys) IsServiceAccount(name string) (bool, string, error) {
-	objectAPI := newObjectLayerWithoutSafeModeFn()
-	if objectAPI == nil || sys == nil || sys.store == nil {
+	if !sys.Initialized() {
 		return false, "", errServerNotInitialized
 	}
 
@@ -826,19 +963,23 @@ func (sys *IAMSys) IsServiceAccount(name string) (bool, string, error) {
 
 // GetUserInfo - get info on a user.
 func (sys *IAMSys) GetUserInfo(name string) (u madmin.UserInfo, err error) {
-	objectAPI := newObjectLayerWithoutSafeModeFn()
-	if objectAPI == nil || sys == nil || sys.store == nil {
+	if !sys.Initialized() {
 		return u, errServerNotInitialized
 	}
 
-	sys.store.rlock()
-	defer sys.store.runlock()
+	select {
+	case <-sys.configLoaded:
+	default:
+		sys.loadUserFromStore(name)
+	}
 
 	if sys.usersSysType != MinIOUsersSysType {
+		sys.store.rlock()
 		// If the user has a mapped policy or is a member of a group, we
 		// return that info. Otherwise we return error.
 		mappedPolicy, ok1 := sys.iamUserPolicyMap[name]
 		memberships, ok2 := sys.iamUserGroupMemberships[name]
+		sys.store.runlock()
 		if !ok1 && !ok2 {
 			return u, errNoSuchUser
 		}
@@ -847,6 +988,9 @@ func (sys *IAMSys) GetUserInfo(name string) (u madmin.UserInfo, err error) {
 			MemberOf:   memberships.ToSlice(),
 		}, nil
 	}
+
+	sys.store.rlock()
+	defer sys.store.runlock()
 
 	cred, found := sys.iamUsersMap[name]
 	if !found {
@@ -857,7 +1001,7 @@ func (sys *IAMSys) GetUserInfo(name string) (u madmin.UserInfo, err error) {
 		return u, errIAMActionNotAllowed
 	}
 
-	u = madmin.UserInfo{
+	return madmin.UserInfo{
 		PolicyName: sys.iamUserPolicyMap[name].Policies,
 		Status: func() madmin.AccountStatus {
 			if cred.IsValid() {
@@ -866,15 +1010,18 @@ func (sys *IAMSys) GetUserInfo(name string) (u madmin.UserInfo, err error) {
 			return madmin.AccountDisabled
 		}(),
 		MemberOf: sys.iamUserGroupMemberships[name].ToSlice(),
-	}
-	return u, nil
+	}, nil
+
 }
 
 // SetUserStatus - sets current user status, supports disabled or enabled.
 func (sys *IAMSys) SetUserStatus(accessKey string, status madmin.AccountStatus) error {
-	objectAPI := newObjectLayerWithoutSafeModeFn()
-	if objectAPI == nil || sys == nil || sys.store == nil {
+	if !sys.Initialized() {
 		return errServerNotInitialized
+	}
+
+	if sys.usersSysType != MinIOUsersSysType {
+		return errIAMActionNotAllowed
 	}
 
 	if status != madmin.AccountEnabled && status != madmin.AccountDisabled {
@@ -883,10 +1030,6 @@ func (sys *IAMSys) SetUserStatus(accessKey string, status madmin.AccountStatus) 
 
 	sys.store.lock()
 	defer sys.store.unlock()
-
-	if sys.usersSysType != MinIOUsersSysType {
-		return errIAMActionNotAllowed
-	}
 
 	cred, ok := sys.iamUsersMap[accessKey]
 	if !ok {
@@ -902,13 +1045,13 @@ func (sys *IAMSys) SetUserStatus(accessKey string, status madmin.AccountStatus) 
 		SecretKey: cred.SecretKey,
 		Status: func() string {
 			if status == madmin.AccountEnabled {
-				return config.EnableOn
+				return auth.AccountOn
 			}
-			return config.EnableOff
+			return auth.AccountOff
 		}(),
 	})
 
-	if err := sys.store.saveUserIdentity(accessKey, regularUser, uinfo); err != nil {
+	if err := sys.store.saveUserIdentity(context.Background(), accessKey, regularUser, uinfo); err != nil {
 		return err
 	}
 
@@ -917,9 +1060,8 @@ func (sys *IAMSys) SetUserStatus(accessKey string, status madmin.AccountStatus) 
 }
 
 // NewServiceAccount - create a new service account
-func (sys *IAMSys) NewServiceAccount(ctx context.Context, parentUser string, sessionPolicy *iampolicy.Policy) (auth.Credentials, error) {
-	objectAPI := newObjectLayerWithoutSafeModeFn()
-	if objectAPI == nil || sys == nil || sys.store == nil {
+func (sys *IAMSys) NewServiceAccount(ctx context.Context, parentUser string, groups []string, sessionPolicy *iampolicy.Policy) (auth.Credentials, error) {
+	if !sys.Initialized() {
 		return auth.Credentials{}, errServerNotInitialized
 	}
 
@@ -947,7 +1089,24 @@ func (sys *IAMSys) NewServiceAccount(ctx context.Context, parentUser string, ses
 
 	cr, ok := sys.iamUsersMap[parentUser]
 	if !ok {
-		return auth.Credentials{}, errNoSuchUser
+		// For LDAP users we would need this fallback
+		if sys.usersSysType != MinIOUsersSysType {
+			_, ok = sys.iamUserPolicyMap[parentUser]
+			if !ok {
+				var found bool
+				for _, group := range groups {
+					_, ok = sys.iamGroupPolicyMap[group]
+					if !ok {
+						continue
+					}
+					found = true
+					break
+				}
+				if !found {
+					return auth.Credentials{}, errNoSuchUser
+				}
+			}
+		}
 	}
 
 	// Disallow service accounts to further create more service accounts.
@@ -971,10 +1130,11 @@ func (sys *IAMSys) NewServiceAccount(ctx context.Context, parentUser string, ses
 		return auth.Credentials{}, err
 	}
 	cred.ParentUser = parentUser
+	cred.Groups = groups
 
 	u := newUserIdentity(cred)
 
-	if err := sys.store.saveUserIdentity(u.Credentials.AccessKey, srvAccUser, u); err != nil {
+	if err := sys.store.saveUserIdentity(context.Background(), u.Credentials.AccessKey, srvAccUser, u); err != nil {
 		return auth.Credentials{}, err
 	}
 
@@ -985,20 +1145,16 @@ func (sys *IAMSys) NewServiceAccount(ctx context.Context, parentUser string, ses
 
 // ListServiceAccounts - lists all services accounts associated to a specific user
 func (sys *IAMSys) ListServiceAccounts(ctx context.Context, accessKey string) ([]string, error) {
-	objectAPI := newObjectLayerWithoutSafeModeFn()
-	if objectAPI == nil || sys == nil || sys.store == nil {
+	if !sys.Initialized() {
 		return nil, errServerNotInitialized
 	}
+
+	<-sys.configLoaded
 
 	sys.store.rlock()
 	defer sys.store.runlock()
 
-	if sys.storeFallback {
-		return nil, errIAMNotInitialized
-	}
-
 	var serviceAccounts []string
-
 	for k, v := range sys.iamUsersMap {
 		if v.IsServiceAccount() && v.ParentUser == accessKey {
 			serviceAccounts = append(serviceAccounts, k)
@@ -1010,8 +1166,7 @@ func (sys *IAMSys) ListServiceAccounts(ctx context.Context, accessKey string) ([
 
 // GetServiceAccountParent - gets information about a service account
 func (sys *IAMSys) GetServiceAccountParent(ctx context.Context, accessKey string) (string, error) {
-	objectAPI := newObjectLayerWithoutSafeModeFn()
-	if objectAPI == nil || sys == nil || sys.store == nil {
+	if !sys.Initialized() {
 		return "", errServerNotInitialized
 	}
 
@@ -1027,8 +1182,7 @@ func (sys *IAMSys) GetServiceAccountParent(ctx context.Context, accessKey string
 
 // DeleteServiceAccount - delete a service account
 func (sys *IAMSys) DeleteServiceAccount(ctx context.Context, accessKey string) error {
-	objectAPI := newObjectLayerWithoutSafeModeFn()
-	if objectAPI == nil || sys == nil || sys.store == nil {
+	if !sys.Initialized() {
 		return errServerNotInitialized
 	}
 
@@ -1041,7 +1195,7 @@ func (sys *IAMSys) DeleteServiceAccount(ctx context.Context, accessKey string) e
 	}
 
 	// It is ok to ignore deletion error on the mapped policy
-	err := sys.store.deleteUserIdentity(accessKey, srvAccUser)
+	err := sys.store.deleteUserIdentity(context.Background(), accessKey, srvAccUser)
 	if err != nil {
 		// ignore if user is already deleted.
 		if err == errNoSuchUser {
@@ -1054,32 +1208,37 @@ func (sys *IAMSys) DeleteServiceAccount(ctx context.Context, accessKey string) e
 	return nil
 }
 
-// SetUser - set user credentials and policy.
-func (sys *IAMSys) SetUser(accessKey string, uinfo madmin.UserInfo) error {
-	objectAPI := newObjectLayerWithoutSafeModeFn()
-	if objectAPI == nil || sys == nil || sys.store == nil {
+// CreateUser - create new user credentials and policy, if user already exists
+// they shall be rewritten with new inputs.
+func (sys *IAMSys) CreateUser(accessKey string, uinfo madmin.UserInfo) error {
+	if !sys.Initialized() {
 		return errServerNotInitialized
 	}
-
-	u := newUserIdentity(auth.Credentials{
-		AccessKey: accessKey,
-		SecretKey: uinfo.SecretKey,
-		Status:    string(uinfo.Status),
-	})
-
-	sys.store.lock()
-	defer sys.store.unlock()
 
 	if sys.usersSysType != MinIOUsersSysType {
 		return errIAMActionNotAllowed
 	}
+
+	sys.store.lock()
+	defer sys.store.unlock()
 
 	cr, ok := sys.iamUsersMap[accessKey]
 	if cr.IsTemp() && ok {
 		return errIAMActionNotAllowed
 	}
 
-	if err := sys.store.saveUserIdentity(accessKey, regularUser, u); err != nil {
+	u := newUserIdentity(auth.Credentials{
+		AccessKey: accessKey,
+		SecretKey: uinfo.SecretKey,
+		Status: func() string {
+			if uinfo.Status == madmin.AccountEnabled {
+				return auth.AccountOn
+			}
+			return auth.AccountOff
+		}(),
+	})
+
+	if err := sys.store.saveUserIdentity(context.Background(), accessKey, regularUser, u); err != nil {
 		return err
 	}
 
@@ -1094,17 +1253,16 @@ func (sys *IAMSys) SetUser(accessKey string, uinfo madmin.UserInfo) error {
 
 // SetUserSecretKey - sets user secret key
 func (sys *IAMSys) SetUserSecretKey(accessKey string, secretKey string) error {
-	objectAPI := newObjectLayerWithoutSafeModeFn()
-	if objectAPI == nil || sys == nil || sys.store == nil {
+	if !sys.Initialized() {
 		return errServerNotInitialized
 	}
-
-	sys.store.lock()
-	defer sys.store.unlock()
 
 	if sys.usersSysType != MinIOUsersSysType {
 		return errIAMActionNotAllowed
 	}
+
+	sys.store.lock()
+	defer sys.store.unlock()
 
 	cred, ok := sys.iamUsersMap[accessKey]
 	if !ok {
@@ -1113,7 +1271,7 @@ func (sys *IAMSys) SetUserSecretKey(accessKey string, secretKey string) error {
 
 	cred.SecretKey = secretKey
 	u := newUserIdentity(cred)
-	if err := sys.store.saveUserIdentity(accessKey, regularUser, u); err != nil {
+	if err := sys.store.saveUserIdentity(context.Background(), accessKey, regularUser, u); err != nil {
 		return err
 	}
 
@@ -1121,55 +1279,75 @@ func (sys *IAMSys) SetUserSecretKey(accessKey string, secretKey string) error {
 	return nil
 }
 
-// GetUser - get user credentials
-func (sys *IAMSys) GetUser(accessKey string) (cred auth.Credentials, ok bool) {
-	objectAPI := newObjectLayerWithoutSafeModeFn()
-	if objectAPI == nil || sys == nil || sys.store == nil {
-		return cred, false
-	}
-
-	sys.store.rlock()
-	fallback := sys.storeFallback
-	sys.store.runlock()
-	if fallback {
-		sys.store.lock()
-		// If user is already found proceed.
-		if _, found := sys.iamUsersMap[accessKey]; !found {
-			sys.store.loadUser(accessKey, regularUser, sys.iamUsersMap)
-			if _, found = sys.iamUsersMap[accessKey]; found {
-				// found user, load its mapped policies
-				sys.store.loadMappedPolicy(accessKey, regularUser, false, sys.iamUserPolicyMap)
+func (sys *IAMSys) loadUserFromStore(accessKey string) {
+	sys.store.lock()
+	// If user is already found proceed.
+	if _, found := sys.iamUsersMap[accessKey]; !found {
+		sys.store.loadUser(context.Background(), accessKey, regularUser, sys.iamUsersMap)
+		if _, found = sys.iamUsersMap[accessKey]; found {
+			// found user, load its mapped policies
+			sys.store.loadMappedPolicy(context.Background(), accessKey, regularUser, false, sys.iamUserPolicyMap)
+		} else {
+			sys.store.loadUser(context.Background(), accessKey, srvAccUser, sys.iamUsersMap)
+			if svc, found := sys.iamUsersMap[accessKey]; found {
+				// Found service account, load its parent user and its mapped policies.
+				if sys.usersSysType == MinIOUsersSysType {
+					sys.store.loadUser(context.Background(), svc.ParentUser, regularUser, sys.iamUsersMap)
+				}
+				sys.store.loadMappedPolicy(context.Background(), svc.ParentUser, regularUser, false, sys.iamUserPolicyMap)
 			} else {
-				sys.store.loadUser(accessKey, srvAccUser, sys.iamUsersMap)
-				if svc, found := sys.iamUsersMap[accessKey]; found {
-					// Found service account, load its parent user and its mapped policies.
-					if sys.usersSysType == MinIOUsersSysType {
-						sys.store.loadUser(svc.ParentUser, regularUser, sys.iamUsersMap)
-					}
-					sys.store.loadMappedPolicy(svc.ParentUser, regularUser, false, sys.iamUserPolicyMap)
-				} else {
-					// None found fall back to STS users.
-					sys.store.loadUser(accessKey, stsUser, sys.iamUsersMap)
-					if _, found = sys.iamUsersMap[accessKey]; found {
-						// STS user found, load its mapped policy.
-						sys.store.loadMappedPolicy(accessKey, stsUser, false, sys.iamUserPolicyMap)
-					}
+				// None found fall back to STS users.
+				sys.store.loadUser(context.Background(), accessKey, stsUser, sys.iamUsersMap)
+				if _, found = sys.iamUsersMap[accessKey]; found {
+					// STS user found, load its mapped policy.
+					sys.store.loadMappedPolicy(context.Background(), accessKey, stsUser, false, sys.iamUserPolicyMap)
 				}
 			}
 		}
-		// Load associated policies if any.
-		for _, policy := range sys.iamUserPolicyMap[accessKey].toSlice() {
-			if _, found := sys.iamPolicyDocsMap[policy]; !found {
-				sys.store.loadPolicyDoc(policy, sys.iamPolicyDocsMap)
-			}
+	}
+
+	// Load associated policies if any.
+	for _, policy := range sys.iamUserPolicyMap[accessKey].toSlice() {
+		if _, found := sys.iamPolicyDocsMap[policy]; !found {
+			sys.store.loadPolicyDoc(context.Background(), policy, sys.iamPolicyDocsMap)
 		}
-		sys.store.unlock()
+	}
+
+	sys.buildUserGroupMemberships()
+	sys.store.unlock()
+}
+
+// GetUser - get user credentials
+func (sys *IAMSys) GetUser(accessKey string) (cred auth.Credentials, ok bool) {
+	if !sys.Initialized() {
+		return cred, false
+	}
+
+	fallback := false
+	select {
+	case <-sys.configLoaded:
+	default:
+		sys.loadUserFromStore(accessKey)
+		fallback = true
 	}
 
 	sys.store.rlock()
+	cred, ok = sys.iamUsersMap[accessKey]
+	if !ok && !fallback {
+		sys.store.runlock()
+		// accessKey not found, also
+		// IAM store is not in fallback mode
+		// we can try to reload again from
+		// the IAM store and see if credential
+		// exists now. If it doesn't proceed to
+		// fail.
+		sys.loadUserFromStore(accessKey)
+
+		sys.store.rlock()
+		cred, ok = sys.iamUsersMap[accessKey]
+	}
 	defer sys.store.runlock()
 
-	cred, ok = sys.iamUsersMap[accessKey]
 	if ok && cred.IsValid() {
 		if cred.ParentUser != "" && sys.usersSysType == MinIOUsersSysType {
 			_, ok = sys.iamUsersMap[cred.ParentUser]
@@ -1187,8 +1365,7 @@ func (sys *IAMSys) GetUser(accessKey string) (cred auth.Credentials, ok bool) {
 // AddUsersToGroup - adds users to a group, creating the group if
 // needed. No error if user(s) already are in the group.
 func (sys *IAMSys) AddUsersToGroup(group string, members []string) error {
-	objectAPI := newObjectLayerWithoutSafeModeFn()
-	if objectAPI == nil || sys == nil || sys.store == nil {
+	if !sys.Initialized() {
 		return errServerNotInitialized
 	}
 
@@ -1196,12 +1373,12 @@ func (sys *IAMSys) AddUsersToGroup(group string, members []string) error {
 		return errInvalidArgument
 	}
 
-	sys.store.lock()
-	defer sys.store.unlock()
-
 	if sys.usersSysType != MinIOUsersSysType {
 		return errIAMActionNotAllowed
 	}
+
+	sys.store.lock()
+	defer sys.store.unlock()
 
 	// Validate that all members exist.
 	for _, member := range members {
@@ -1225,7 +1402,7 @@ func (sys *IAMSys) AddUsersToGroup(group string, members []string) error {
 		gi.Members = uniqMembers
 	}
 
-	if err := sys.store.saveGroupInfo(group, gi); err != nil {
+	if err := sys.store.saveGroupInfo(context.Background(), group, gi); err != nil {
 		return err
 	}
 
@@ -1248,9 +1425,12 @@ func (sys *IAMSys) AddUsersToGroup(group string, members []string) error {
 // RemoveUsersFromGroup - remove users from group. If no users are
 // given, and the group is empty, deletes the group as well.
 func (sys *IAMSys) RemoveUsersFromGroup(group string, members []string) error {
-	objectAPI := newObjectLayerWithoutSafeModeFn()
-	if objectAPI == nil || sys == nil || sys.store == nil {
+	if !sys.Initialized() {
 		return errServerNotInitialized
+	}
+
+	if sys.usersSysType != MinIOUsersSysType {
+		return errIAMActionNotAllowed
 	}
 
 	if group == "" {
@@ -1259,10 +1439,6 @@ func (sys *IAMSys) RemoveUsersFromGroup(group string, members []string) error {
 
 	sys.store.lock()
 	defer sys.store.unlock()
-
-	if sys.usersSysType != MinIOUsersSysType {
-		return errIAMActionNotAllowed
-	}
 
 	// Validate that all members exist.
 	for _, member := range members {
@@ -1290,10 +1466,10 @@ func (sys *IAMSys) RemoveUsersFromGroup(group string, members []string) error {
 
 		// Remove the group from storage. First delete the
 		// mapped policy. No-mapped-policy case is ignored.
-		if err := sys.store.deleteMappedPolicy(group, regularUser, true); err != nil && err != errNoSuchPolicy {
+		if err := sys.store.deleteMappedPolicy(context.Background(), group, regularUser, true); err != nil && err != errNoSuchPolicy {
 			return err
 		}
-		if err := sys.store.deleteGroupInfo(group); err != nil && err != errNoSuchGroup {
+		if err := sys.store.deleteGroupInfo(context.Background(), group); err != nil && err != errNoSuchGroup {
 			return err
 		}
 
@@ -1308,7 +1484,7 @@ func (sys *IAMSys) RemoveUsersFromGroup(group string, members []string) error {
 	d := set.CreateStringSet(members...)
 	gi.Members = s.Difference(d).ToSlice()
 
-	err := sys.store.saveGroupInfo(group, gi)
+	err := sys.store.saveGroupInfo(context.Background(), group, gi)
 	if err != nil {
 		return err
 	}
@@ -1329,17 +1505,16 @@ func (sys *IAMSys) RemoveUsersFromGroup(group string, members []string) error {
 
 // SetGroupStatus - enable/disabled a group
 func (sys *IAMSys) SetGroupStatus(group string, enabled bool) error {
-	objectAPI := newObjectLayerWithoutSafeModeFn()
-	if objectAPI == nil || sys == nil || sys.store == nil {
+	if !sys.Initialized() {
 		return errServerNotInitialized
 	}
-
-	sys.store.lock()
-	defer sys.store.unlock()
 
 	if sys.usersSysType != MinIOUsersSysType {
 		return errIAMActionNotAllowed
 	}
+
+	sys.store.lock()
+	defer sys.store.unlock()
 
 	if group == "" {
 		return errInvalidArgument
@@ -1356,7 +1531,7 @@ func (sys *IAMSys) SetGroupStatus(group string, enabled bool) error {
 		gi.Status = statusDisabled
 	}
 
-	if err := sys.store.saveGroupInfo(group, gi); err != nil {
+	if err := sys.store.saveGroupInfo(context.Background(), group, gi); err != nil {
 		return err
 	}
 	sys.iamGroupsMap[group] = gi
@@ -1365,8 +1540,7 @@ func (sys *IAMSys) SetGroupStatus(group string, enabled bool) error {
 
 // GetGroupDescription - builds up group description
 func (sys *IAMSys) GetGroupDescription(group string) (gd madmin.GroupDesc, err error) {
-	objectAPI := newObjectLayerWithoutSafeModeFn()
-	if objectAPI == nil || sys == nil || sys.store == nil {
+	if !sys.Initialized() {
 		return gd, errServerNotInitialized
 	}
 
@@ -1375,11 +1549,7 @@ func (sys *IAMSys) GetGroupDescription(group string) (gd madmin.GroupDesc, err e
 		return gd, err
 	}
 
-	// A group may be mapped to at most one policy.
-	policy := ""
-	if len(ps) > 0 {
-		policy = ps[0]
-	}
+	policy := strings.Join(ps, ",")
 
 	if sys.usersSysType != MinIOUsersSysType {
 		return madmin.GroupDesc{
@@ -1406,37 +1576,39 @@ func (sys *IAMSys) GetGroupDescription(group string) (gd madmin.GroupDesc, err e
 
 // ListGroups - lists groups.
 func (sys *IAMSys) ListGroups() (r []string, err error) {
-	objectAPI := newObjectLayerWithoutSafeModeFn()
-	if objectAPI == nil || sys == nil || sys.store == nil {
+	if !sys.Initialized() {
 		return r, errServerNotInitialized
-	}
-
-	sys.store.rlock()
-	defer sys.store.runlock()
-
-	if sys.storeFallback {
-		return nil, errIAMNotInitialized
 	}
 
 	if sys.usersSysType != MinIOUsersSysType {
 		return nil, errIAMActionNotAllowed
 	}
 
+	<-sys.configLoaded
+
+	sys.store.rlock()
+	defer sys.store.runlock()
+
+	r = make([]string, 0, len(sys.iamGroupsMap))
 	for k := range sys.iamGroupsMap {
 		r = append(r, k)
 	}
+
 	return r, nil
 }
 
 // PolicyDBSet - sets a policy for a user or group in the PolicyDB.
 func (sys *IAMSys) PolicyDBSet(name, policy string, isGroup bool) error {
-	objectAPI := newObjectLayerWithoutSafeModeFn()
-	if objectAPI == nil || sys == nil || sys.store == nil {
+	if !sys.Initialized() {
 		return errServerNotInitialized
 	}
 
 	sys.store.lock()
 	defer sys.store.unlock()
+
+	if sys.usersSysType == LDAPUsersSysType {
+		return sys.policyDBSet(name, policy, stsUser, isGroup)
+	}
 
 	return sys.policyDBSet(name, policy, regularUser, isGroup)
 }
@@ -1462,7 +1634,7 @@ func (sys *IAMSys) policyDBSet(name, policyName string, userType IAMUserType, is
 
 	// Handle policy mapping removal
 	if policyName == "" {
-		if err := sys.store.deleteMappedPolicy(name, userType, isGroup); err != nil && err != errNoSuchPolicy {
+		if err := sys.store.deleteMappedPolicy(context.Background(), name, userType, isGroup); err != nil && err != errNoSuchPolicy {
 			return err
 		}
 		if !isGroup {
@@ -1482,7 +1654,7 @@ func (sys *IAMSys) policyDBSet(name, policyName string, userType IAMUserType, is
 	}
 
 	// Handle policy mapping set/update
-	if err := sys.store.saveMappedPolicy(name, userType, isGroup, mp); err != nil {
+	if err := sys.store.saveMappedPolicy(context.Background(), name, userType, isGroup, mp); err != nil {
 		return err
 	}
 	if !isGroup {
@@ -1493,12 +1665,10 @@ func (sys *IAMSys) policyDBSet(name, policyName string, userType IAMUserType, is
 	return nil
 }
 
-// PolicyDBGet - gets policy set on a user or group. Since a user may
-// be a member of multiple groups, this function returns an array of
-// applicable policies (each group is mapped to at most one policy).
-func (sys *IAMSys) PolicyDBGet(name string, isGroup bool) ([]string, error) {
-	objectAPI := newObjectLayerWithoutSafeModeFn()
-	if objectAPI == nil || sys == nil || sys.store == nil {
+// PolicyDBGet - gets policy set on a user or group. If a list of groups is
+// given, policies associated with them are included as well.
+func (sys *IAMSys) PolicyDBGet(name string, isGroup bool, groups ...string) ([]string, error) {
+	if !sys.Initialized() {
 		return nil, errServerNotInitialized
 	}
 
@@ -1509,33 +1679,75 @@ func (sys *IAMSys) PolicyDBGet(name string, isGroup bool) ([]string, error) {
 	sys.store.rlock()
 	defer sys.store.runlock()
 
-	return sys.policyDBGet(name, isGroup)
+	policies, err := sys.policyDBGet(name, isGroup)
+	if err != nil {
+		return nil, err
+	}
+
+	if !isGroup {
+		for _, group := range groups {
+			ps, err := sys.policyDBGet(group, true)
+			if err != nil {
+				return nil, err
+			}
+			policies = append(policies, ps...)
+		}
+	}
+
+	return policies, nil
 }
 
-// This call assumes that caller has the sys.RLock()
-func (sys *IAMSys) policyDBGet(name string, isGroup bool) ([]string, error) {
+// This call assumes that caller has the sys.RLock().
+//
+// If a group is passed, it returns policies associated with the group.
+//
+// If a user is passed, it returns policies of the user along with any groups
+// that the server knows the user is a member of.
+//
+// In LDAP users mode, the server does not store any group membership
+// information in IAM (i.e sys.iam*Map) - this info is stored only in the STS
+// generated credentials. Thus we skip looking up group memberships, user map,
+// and group map and check the appropriate policy maps directly.
+func (sys *IAMSys) policyDBGet(name string, isGroup bool) (policies []string, err error) {
 	if isGroup {
-		if _, ok := sys.iamGroupsMap[name]; !ok {
-			return nil, errNoSuchGroup
+		if sys.usersSysType == MinIOUsersSysType {
+			g, ok := sys.iamGroupsMap[name]
+			if !ok {
+				return nil, errNoSuchGroup
+			}
+
+			// Group is disabled, so we return no policy - this
+			// ensures the request is denied.
+			if g.Status == statusDisabled {
+				return nil, nil
+			}
 		}
 
-		mp := sys.iamGroupPolicyMap[name]
-		return mp.toSlice(), nil
+		return sys.iamGroupPolicyMap[name].toSlice(), nil
 	}
 
-	// When looking for a user's policies, we also check if the
-	// user and the groups they are member of are enabled.
-	if u, ok := sys.iamUsersMap[name]; !ok {
-		return nil, errNoSuchUser
-	} else if u.Status == statusDisabled {
-		// User is disabled, so we return no policy - this
-		// ensures the request is denied.
-		return nil, nil
+	var u auth.Credentials
+	var ok bool
+	if sys.usersSysType == MinIOUsersSysType {
+		// When looking for a user's policies, we also check if the user
+		// and the groups they are member of are enabled.
+
+		u, ok = sys.iamUsersMap[name]
+		if !ok {
+			return nil, errNoSuchUser
+		}
+		if !u.IsValid() {
+			return nil, nil
+		}
 	}
 
-	var policies []string
+	mp, ok := sys.iamUserPolicyMap[name]
+	if !ok {
+		if u.ParentUser != "" {
+			mp = sys.iamUserPolicyMap[u.ParentUser]
+		}
+	}
 
-	mp := sys.iamUserPolicyMap[name]
 	// returned policy could be empty
 	policies = append(policies, mp.toSlice()...)
 
@@ -1546,9 +1758,9 @@ func (sys *IAMSys) policyDBGet(name string, isGroup bool) ([]string, error) {
 			continue
 		}
 
-		p := sys.iamGroupPolicyMap[group]
-		policies = append(policies, p.toSlice()...)
+		policies = append(policies, sys.iamGroupPolicyMap[group].toSlice()...)
 	}
+
 	return policies, nil
 }
 
@@ -1575,13 +1787,14 @@ func (sys *IAMSys) IsAllowedServiceAccount(args iampolicy.Args, parent string) b
 		return false
 	}
 
-	// Check if the parent is allowed to perform this action, reject if not
-	parentUserPolicies, err := sys.PolicyDBGet(parent, false)
+	// Check policy for this service account.
+	svcPolicies, err := sys.PolicyDBGet(parent, false, args.Groups...)
 	if err != nil {
+		logger.LogIf(GlobalContext, err)
 		return false
 	}
 
-	if len(parentUserPolicies) == 0 {
+	if len(svcPolicies) == 0 {
 		return false
 	}
 
@@ -1589,7 +1802,7 @@ func (sys *IAMSys) IsAllowedServiceAccount(args iampolicy.Args, parent string) b
 
 	// Policies were found, evaluate all of them.
 	sys.store.rlock()
-	for _, pname := range parentUserPolicies {
+	for _, pname := range svcPolicies {
 		p, found := sys.iamPolicyDocsMap[pname]
 		if found {
 			availablePolicies = append(availablePolicies, p)
@@ -1656,74 +1869,68 @@ func (sys *IAMSys) IsAllowedServiceAccount(args iampolicy.Args, parent string) b
 }
 
 // IsAllowedLDAPSTS - checks for LDAP specific claims and values
-func (sys *IAMSys) IsAllowedLDAPSTS(args iampolicy.Args) bool {
-	userIface, ok := args.Claims[ldapUser]
-	if !ok {
-		return false
-	}
-	user, ok := userIface.(string)
-	if !ok {
-		return false
-	}
-
-	sys.store.rlock()
-	defer sys.store.runlock()
-
-	var groups []string
-	cred, ok := sys.iamUsersMap[args.AccountName]
-	if !ok {
-		return false
-	}
-	groups = cred.Groups
-
-	// We look up the policy mapping directly to bypass
-	// users exists, group exists validations that do not
-	// apply here.
-	var policies []iampolicy.Policy
-	if mp, ok := sys.iamUserPolicyMap[user]; ok {
-		for _, pname := range mp.toSlice() {
-			p, found := sys.iamPolicyDocsMap[pname]
-			if !found {
-				logger.LogIf(GlobalContext, fmt.Errorf("expected policy (%s) missing for the LDAPUser %s, rejecting the request", pname, user))
-				return false
-			}
-			policies = append(policies, p)
-		}
-	}
-	for _, group := range groups {
-		mp, ok := sys.iamGroupPolicyMap[group]
+func (sys *IAMSys) IsAllowedLDAPSTS(args iampolicy.Args, parentUser string) bool {
+	parentInClaimIface, ok := args.Claims[ldapUser]
+	if ok {
+		parentInClaim, ok := parentInClaimIface.(string)
 		if !ok {
-			continue
+			// ldap parentInClaim name is not a string reject it.
+			return false
 		}
-		for _, pname := range mp.toSlice() {
-			p, found := sys.iamPolicyDocsMap[pname]
-			if !found {
-				logger.LogIf(GlobalContext, fmt.Errorf("expected policy (%s) missing for the LDAPGroup %s, rejecting the request", pname, group))
-				return false
-			}
-			policies = append(policies, p)
+
+		if parentInClaim != parentUser {
+			// ldap claim has been modified maliciously reject it.
+			return false
 		}
-	}
-	if len(policies) == 0 {
+	} else {
+		// no ldap parentInClaim claim present reject it.
 		return false
 	}
-	combinedPolicy := policies[0]
-	for i := 1; i < len(policies); i++ {
+
+	// Check policy for this LDAP user.
+	ldapPolicies, err := sys.PolicyDBGet(parentUser, false, args.Groups...)
+	if err != nil {
+		return false
+	}
+
+	if len(ldapPolicies) == 0 {
+		return false
+	}
+
+	var availablePolicies []iampolicy.Policy
+
+	// Policies were found, evaluate all of them.
+	sys.store.rlock()
+	for _, pname := range ldapPolicies {
+		p, found := sys.iamPolicyDocsMap[pname]
+		if found {
+			availablePolicies = append(availablePolicies, p)
+		}
+	}
+	sys.store.runlock()
+
+	if len(availablePolicies) == 0 {
+		return false
+	}
+
+	combinedPolicy := availablePolicies[0]
+	for i := 1; i < len(availablePolicies); i++ {
 		combinedPolicy.Statements =
 			append(combinedPolicy.Statements,
-				policies[i].Statements...)
+				availablePolicies[i].Statements...)
 	}
+
 	return combinedPolicy.IsAllowed(args)
 }
 
 // IsAllowedSTS is meant for STS based temporary credentials,
 // which implements claims validation and verification other than
 // applying policies.
-func (sys *IAMSys) IsAllowedSTS(args iampolicy.Args) bool {
+func (sys *IAMSys) IsAllowedSTS(args iampolicy.Args, parentUser string) bool {
 	// If it is an LDAP request, check that user and group
 	// policies allow the request.
 	if sys.usersSysType == LDAPUsersSysType {
-		return sys.IsAllowedLDAPSTS(args)
+		return sys.IsAllowedLDAPSTS(args, parentUser)
 	}
 
 	policies, ok := args.GetPolicies(iamPolicyClaimNameOpenID())
@@ -1804,6 +2011,33 @@ func (sys *IAMSys) IsAllowedSTS(args iampolicy.Args) bool {
 	return combinedPolicy.IsAllowed(args)
 }
 
+// GetCombinedPolicy returns a combined policy combining all policies
+func (sys *IAMSys) GetCombinedPolicy(policies ...string) iampolicy.Policy {
+	// Policies were found, evaluate all of them.
+	sys.store.rlock()
+	defer sys.store.runlock()
+
+	var availablePolicies []iampolicy.Policy
+	for _, pname := range policies {
+		p, found := sys.iamPolicyDocsMap[pname]
+		if found {
+			availablePolicies = append(availablePolicies, p)
+		}
+	}
+
+	if len(availablePolicies) == 0 {
+		return iampolicy.Policy{}
+	}
+
+	combinedPolicy := availablePolicies[0]
+	for i := 1; i < len(availablePolicies); i++ {
+		combinedPolicy.Statements = append(combinedPolicy.Statements,
+			availablePolicies[i].Statements...)
+	}
+
+	return combinedPolicy
+}
+
 // IsAllowed - checks given policy args is allowed to continue the Rest API.
 func (sys *IAMSys) IsAllowed(args iampolicy.Args) bool {
 	// If opa is configured, use OPA always.
@@ -1821,16 +2055,16 @@ func (sys *IAMSys) IsAllowed(args iampolicy.Args) bool {
 	}
 
 	// If the credential is temporary, perform STS related checks.
-	ok, err := sys.IsTempUser(args.AccountName)
+	ok, parentUser, err := sys.IsTempUser(args.AccountName)
 	if err != nil {
 		return false
 	}
 	if ok {
-		return sys.IsAllowedSTS(args)
+		return sys.IsAllowedSTS(args, parentUser)
 	}
 
 	// If the credential is for a service account, perform related check
-	ok, parentUser, err := sys.IsServiceAccount(args.AccountName)
+	ok, parentUser, err = sys.IsServiceAccount(args.AccountName)
 	if err != nil {
 		return false
 	}
@@ -1839,7 +2073,7 @@ func (sys *IAMSys) IsAllowed(args iampolicy.Args) bool {
 	}
 
 	// Continue with the assumption of a regular user
-	policies, err := sys.PolicyDBGet(args.AccountName, false)
+	policies, err := sys.PolicyDBGet(args.AccountName, false, args.Groups...)
 	if err != nil {
 		return false
 	}
@@ -1850,25 +2084,7 @@ func (sys *IAMSys) IsAllowed(args iampolicy.Args) bool {
 	}
 
 	// Policies were found, evaluate all of them.
-	sys.store.rlock()
-	defer sys.store.runlock()
-
-	var availablePolicies []iampolicy.Policy
-	for _, pname := range policies {
-		p, found := sys.iamPolicyDocsMap[pname]
-		if found {
-			availablePolicies = append(availablePolicies, p)
-		}
-	}
-	if len(availablePolicies) == 0 {
-		return false
-	}
-	combinedPolicy := availablePolicies[0]
-	for i := 1; i < len(availablePolicies); i++ {
-		combinedPolicy.Statements = append(combinedPolicy.Statements,
-			availablePolicies[i].Statements...)
-	}
-	return combinedPolicy.IsAllowed(args)
+	return sys.GetCombinedPolicy(policies...).IsAllowed(args)
 }
 
 // Set default canned policies only if not already overridden by users.
@@ -1888,6 +2104,10 @@ func setDefaultCannedPolicies(policies map[string]iampolicy.Policy) {
 	_, ok = policies["diagnostics"]
 	if !ok {
 		policies["diagnostics"] = iampolicy.AdminDiagnostics
+	}
+	_, ok = policies["consoleAdmin"]
+	if !ok {
+		policies["consoleAdmin"] = iampolicy.Admin
 	}
 }
 
@@ -1930,9 +2150,6 @@ func (sys *IAMSys) removeGroupFromMembershipsMap(group string) {
 
 // EnableLDAPSys - enable ldap system users type.
 func (sys *IAMSys) EnableLDAPSys() {
-	sys.store.lock()
-	defer sys.store.unlock()
-
 	sys.usersSysType = LDAPUsersSysType
 }
 
@@ -1946,6 +2163,6 @@ func NewIAMSys() *IAMSys {
 		iamGroupPolicyMap:       make(map[string]MappedPolicy),
 		iamGroupsMap:            make(map[string]GroupInfo),
 		iamUserGroupMemberships: make(map[string]set.StringSet),
-		storeFallback:           true,
+		configLoaded:            make(chan struct{}),
 	}
 }

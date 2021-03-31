@@ -18,10 +18,14 @@ package cmd
 
 import (
 	"crypto/x509"
+	"net/http"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/minio/minio-go/v7/pkg/set"
+	"github.com/minio/minio/pkg/bucket/bandwidth"
+	"github.com/minio/minio/pkg/handlers"
 
 	humanize "github.com/dustin/go-humanize"
 	"github.com/minio/minio/cmd/config/cache"
@@ -34,7 +38,7 @@ import (
 	"github.com/minio/minio/cmd/crypto"
 	xhttp "github.com/minio/minio/cmd/http"
 	"github.com/minio/minio/pkg/auth"
-	etcd "go.etcd.io/etcd/v3/clientv3"
+	etcd "go.etcd.io/etcd/clientv3"
 
 	"github.com/minio/minio/pkg/certs"
 	"github.com/minio/minio/pkg/event"
@@ -83,8 +87,9 @@ const (
 
 	// GlobalStaleUploadsExpiry - Expiry duration after which the uploads in multipart, tmp directory are deemed stale.
 	GlobalStaleUploadsExpiry = time.Hour * 24 // 24 hrs.
+
 	// GlobalStaleUploadsCleanupInterval - Cleanup interval when the stale uploads cleanup is initiated.
-	GlobalStaleUploadsCleanupInterval = time.Hour * 24 // 24 hrs.
+	GlobalStaleUploadsCleanupInterval = time.Hour * 12 // 12 hrs.
 
 	// GlobalServiceExecutionInterval - Executes the Lifecycle events.
 	GlobalServiceExecutionInterval = time.Hour * 24 // 24 hrs.
@@ -92,7 +97,7 @@ const (
 	// Refresh interval to update in-memory iam config cache.
 	globalRefreshIAMInterval = 5 * time.Minute
 
-	// Limit of location constraint XML for unauthenticted PUT bucket operations.
+	// Limit of location constraint XML for unauthenticated PUT bucket operations.
 	maxLocationConstraintSize = 3 * humanize.MiByte
 
 	// Maximum size of default bucket encryption configuration allowed
@@ -149,6 +154,7 @@ var (
 	globalEnvTargetList *event.TargetList
 
 	globalBucketMetadataSys *BucketMetadataSys
+	globalBucketMonitor     *bandwidth.Monitor
 	globalPolicySys         *PolicySys
 	globalIAMSys            *IAMSys
 
@@ -157,7 +163,7 @@ var (
 	globalBucketTargetSys    *BucketTargetSys
 	// globalAPIConfig controls S3 API requests throttling,
 	// healthcheck readiness deadlines and cors settings.
-	globalAPIConfig apiConfig
+	globalAPIConfig = apiConfig{listQuorum: 3}
 
 	globalStorageClass storageclass.Config
 	globalLDAPConfig   xldap.Config
@@ -167,7 +173,7 @@ var (
 	globalRootCAs *x509.CertPool
 
 	// IsSSL indicates if the server is configured with SSL.
-	globalIsSSL bool
+	globalIsTLS bool
 
 	globalTLSCerts *certs.Manager
 
@@ -175,9 +181,9 @@ var (
 	globalHTTPServerErrorCh = make(chan error)
 	globalOSSignalCh        = make(chan os.Signal, 1)
 
-	// global Trace system to send HTTP request/response logs to
-	// registered listeners
-	globalHTTPTrace = pubsub.New()
+	// global Trace system to send HTTP request/response
+	// and Storage/OS calls info to registered listeners.
+	globalTrace = pubsub.New()
 
 	// global Listen system to send S3 API events to registered listeners
 	globalHTTPListen = pubsub.New()
@@ -186,7 +192,12 @@ var (
 	// registered listeners
 	globalConsoleSys *HTTPConsoleLoggerSys
 
-	globalEndpoints EndpointZones
+	globalEndpoints EndpointServerPools
+
+	// The name of this local node, fetched from arguments
+	globalLocalNodeName string
+
+	globalRemoteEndpoints map[string]Endpoint
 
 	// Global server's network statistics
 	globalConnStats = newConnStats()
@@ -210,7 +221,8 @@ var (
 	globalDomainNames []string      // Root domains for virtual host style requests
 	globalDomainIPs   set.StringSet // Root domain IP address(s) for a distributed MinIO deployment
 
-	globalOperationTimeout = newDynamicTimeout(10*time.Minute, 5*time.Minute) // default timeout for general ops
+	globalOperationTimeout       = newDynamicTimeout(10*time.Minute, 5*time.Minute) // default timeout for general ops
+	globalDeleteOperationTimeout = newDynamicTimeout(5*time.Minute, 1*time.Minute)  // default time for delete ops
 
 	globalBucketObjectLockSys *BucketObjectLockSys
 	globalBucketQuotaSys      *BucketQuotaSys
@@ -241,7 +253,8 @@ var (
 	globalAutoEncryption bool
 
 	// Is compression enabled?
-	globalCompressConfig compress.Config
+	globalCompressConfigMu sync.Mutex
+	globalCompressConfig   compress.Config
 
 	// Some standard object extensions which we strictly dis-allow for compression.
 	standardExcludeCompressExtensions = []string{".gz", ".bz2", ".rar", ".zip", ".7z", ".xz", ".mp4", ".mkv", ".mov"}
@@ -267,15 +280,18 @@ var (
 	globalBackgroundHealRoutine *healRoutine
 	globalBackgroundHealState   *allHealState
 
-	// Only enabled when one of the sub-systems fail
-	// to initialize, this allows for administrators to
-	// fix the system.
-	globalSafeMode bool
-
 	// If writes to FS backend should be O_SYNC.
 	globalFSOSync bool
 
 	globalProxyEndpoints []ProxyEndpoint
+
+	globalInternodeTransport http.RoundTripper
+
+	globalProxyTransport http.RoundTripper
+
+	globalDNSCache *xhttp.DNSCache
+
+	globalForwarder *handlers.Forwarder
 	// Add new variable global values here.
 )
 

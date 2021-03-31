@@ -18,9 +18,9 @@ package cmd
 
 import (
 	"context"
-	"path"
 	"time"
 
+	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/madmin"
 )
 
@@ -54,20 +54,39 @@ func (h *healRoutine) queueHealTask(task healTask) {
 	h.tasks <- task
 }
 
-func waitForLowHTTPReq(tolerance int32, maxWait time.Duration) {
-	const wait = 10 * time.Millisecond
-	waitCount := maxWait / wait
+func waitForLowHTTPReq(maxIO int, maxWait time.Duration) {
+	// No need to wait run at full speed.
+	if maxIO <= 0 {
+		return
+	}
+
+	// At max 10 attempts to wait with 100 millisecond interval before proceeding
+	waitTick := 100 * time.Millisecond
 
 	// Bucket notification and http trace are not costly, it is okay to ignore them
 	// while counting the number of concurrent connections
-	tolerance += int32(globalHTTPListen.NumSubscribers() + globalHTTPTrace.NumSubscribers())
+	maxIOFn := func() int {
+		return maxIO + int(globalHTTPListen.NumSubscribers()) + int(globalTrace.NumSubscribers())
+	}
 
+	tmpMaxWait := maxWait
 	if httpServer := newHTTPServerFn(); httpServer != nil {
 		// Any requests in progress, delay the heal.
-		for (httpServer.GetRequestCount() >= tolerance) &&
-			waitCount > 0 {
-			waitCount--
-			time.Sleep(wait)
+		for httpServer.GetRequestCount() >= maxIOFn() {
+			if tmpMaxWait > 0 {
+				if tmpMaxWait < waitTick {
+					time.Sleep(tmpMaxWait)
+				} else {
+					time.Sleep(waitTick)
+				}
+				tmpMaxWait = tmpMaxWait - waitTick
+			}
+			if tmpMaxWait <= 0 {
+				if intDataUpdateTracker.debug {
+					logger.Info("waitForLowHTTPReq: waited max %s, resuming", maxWait)
+				}
+				break
+			}
 		}
 	}
 }
@@ -78,26 +97,22 @@ func (h *healRoutine) run(ctx context.Context, objAPI ObjectLayer) {
 		select {
 		case task, ok := <-h.tasks:
 			if !ok {
-				break
+				return
 			}
-
-			// Wait and proceed if there are active requests
-			waitForLowHTTPReq(int32(globalEndpoints.NEndpoints()), time.Second)
 
 			var res madmin.HealResultItem
 			var err error
-			switch {
-			case task.bucket == nopHeal:
+			switch task.bucket {
+			case nopHeal:
 				continue
-			case task.bucket == SlashSeparator:
+			case SlashSeparator:
 				res, err = healDiskFormat(ctx, objAPI, task.opts)
-			case task.bucket != "" && task.object == "":
-				res, err = objAPI.HealBucket(ctx, task.bucket, task.opts.DryRun, task.opts.Remove)
-			case task.bucket != "" && task.object != "":
-				res, err = objAPI.HealObject(ctx, task.bucket, task.object, task.versionID, task.opts)
-			}
-			if task.bucket != "" && task.object != "" {
-				ObjectPathUpdated(path.Join(task.bucket, task.object))
+			default:
+				if task.object == "" {
+					res, err = objAPI.HealBucket(ctx, task.bucket, task.opts)
+				} else {
+					res, err = objAPI.HealObject(ctx, task.bucket, task.object, task.versionID, task.opts)
+				}
 			}
 			task.responseCh <- healResult{result: res, err: err}
 

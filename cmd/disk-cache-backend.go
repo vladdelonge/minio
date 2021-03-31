@@ -19,9 +19,10 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -70,7 +71,9 @@ type cacheMeta struct {
 	// Ranges maps cached range to associated filename.
 	Ranges map[string]string `json:"ranges,omitempty"`
 	// Hits is a counter on the number of times this object has been accessed so far.
-	Hits int `json:"hits,omitempty"`
+	Hits   int    `json:"hits,omitempty"`
+	Bucket string `json:"bucket,omitempty"`
+	Object string `json:"object,omitempty"`
 }
 
 // RangeInfo has the range, file and range length information for a cached range.
@@ -99,7 +102,6 @@ func (m *cacheMeta) ToObjectInfo(bucket, object string) (o ObjectInfo) {
 	}
 
 	// We set file info only if its valid.
-	o.ModTime = m.Stat.ModTime
 	o.Size = m.Stat.Size
 	o.ETag = extractETag(m.Meta)
 	o.ContentType = m.Meta["content-type"]
@@ -118,6 +120,12 @@ func (m *cacheMeta) ToObjectInfo(bucket, object string) (o ObjectInfo) {
 			o.Expires = t.UTC()
 		}
 	}
+	if mtime, ok := m.Meta["last-modified"]; ok {
+		if t, e = time.Parse(http.TimeFormat, mtime); e == nil {
+			o.ModTime = t.UTC()
+		}
+	}
+
 	// etag/md5Sum has already been extracted. We need to
 	// remove to avoid it from appearing as part of user-defined metadata
 	o.UserDefined = cleanMetadata(m.Meta)
@@ -130,19 +138,21 @@ type diskCache struct {
 	online       uint32 // ref: https://golang.org/pkg/sync/atomic/#pkg-note-BUG
 	purgeRunning int32
 
-	triggerGC     chan struct{}
-	dir           string         // caching directory
-	stats         CacheDiskStats // disk cache stats for prometheus
-	quotaPct      int            // max usage in %
-	pool          sync.Pool
-	after         int // minimum accesses before an object is cached.
-	lowWatermark  int
-	highWatermark int
-	enableRange   bool
+	triggerGC        chan struct{}
+	dir              string         // caching directory
+	stats            CacheDiskStats // disk cache stats for prometheus
+	quotaPct         int            // max usage in %
+	pool             sync.Pool
+	after            int // minimum accesses before an object is cached.
+	lowWatermark     int
+	highWatermark    int
+	enableRange      bool
+	commitWriteback  bool
+	retryWritebackCh chan ObjectInfo
 	// nsMutex namespace lock
 	nsMutex *nsLockMap
 	// Object functions pointing to the corresponding functions of backend implementation.
-	NewNSLockFn func(ctx context.Context, cachePath string) RWLocker
+	NewNSLockFn func(cachePath string) RWLocker
 }
 
 // Inits the disk cache dir if it is not initialized already.
@@ -156,15 +166,17 @@ func newDiskCache(ctx context.Context, dir string, config cache.Config) (*diskCa
 		return nil, fmt.Errorf("Unable to initialize '%s' dir, %w", dir, err)
 	}
 	cache := diskCache{
-		dir:           dir,
-		triggerGC:     make(chan struct{}, 1),
-		stats:         CacheDiskStats{Dir: dir},
-		quotaPct:      quotaPct,
-		after:         config.After,
-		lowWatermark:  config.WatermarkLow,
-		highWatermark: config.WatermarkHigh,
-		enableRange:   config.Range,
-		online:        1,
+		dir:              dir,
+		triggerGC:        make(chan struct{}, 1),
+		stats:            CacheDiskStats{Dir: dir},
+		quotaPct:         quotaPct,
+		after:            config.After,
+		lowWatermark:     config.WatermarkLow,
+		highWatermark:    config.WatermarkHigh,
+		enableRange:      config.Range,
+		commitWriteback:  config.CommitWriteback,
+		retryWritebackCh: make(chan ObjectInfo, 10000),
+		online:           1,
 		pool: sync.Pool{
 			New: func() interface{} {
 				b := disk.AlignedBlock(int(cacheBlkSize))
@@ -174,9 +186,12 @@ func newDiskCache(ctx context.Context, dir string, config cache.Config) (*diskCa
 		nsMutex: newNSLock(false),
 	}
 	go cache.purgeWait(ctx)
+	if cache.commitWriteback {
+		go cache.scanCacheWritebackFailures(ctx)
+	}
 	cache.diskSpaceAvailable(0) // update if cache usage is already high.
-	cache.NewNSLockFn = func(ctx context.Context, cachePath string) RWLocker {
-		return cache.nsMutex.NewNSLock(ctx, nil, cachePath, "")
+	cache.NewNSLockFn = func(cachePath string) RWLocker {
+		return cache.nsMutex.NewNSLock(nil, cachePath, "")
 	}
 	return &cache, nil
 }
@@ -194,9 +209,9 @@ func (c *diskCache) diskUsageLow() bool {
 		logger.LogIf(ctx, err)
 		return false
 	}
-	usedPercent := (di.Used / di.Total) * 100
+	usedPercent := float64(di.Used) * 100 / float64(di.Total)
 	low := int(usedPercent) < gcStopPct
-	atomic.StoreUint64(&c.stats.UsagePercent, usedPercent)
+	atomic.StoreUint64(&c.stats.UsagePercent, uint64(usedPercent))
 	if low {
 		atomic.StoreInt32(&c.stats.UsageState, 0)
 	}
@@ -252,10 +267,6 @@ func (c *diskCache) toClear() uint64 {
 	}
 	return bytesToClear(int64(di.Total), int64(di.Free), uint64(c.quotaPct), uint64(c.lowWatermark), uint64(c.highWatermark))
 }
-
-var (
-	errDoneForNow = errors.New("done for now")
-)
 
 func (c *diskCache) purgeWait(ctx context.Context) {
 	for {
@@ -323,6 +334,12 @@ func (c *diskCache) purge(ctx context.Context) {
 		// stat all cached file ranges and cacheDataFile.
 		cachedFiles := fiStatFn(meta.Ranges, cacheDataFile, pathJoin(c.dir, name))
 		objInfo := meta.ToObjectInfo("", "")
+		// prevent gc from clearing un-synced commits. This metadata is present when
+		// cache writeback commit setting is enabled.
+		status, ok := objInfo.UserDefined[writeBackStatusHeader]
+		if ok && status != CommitComplete.String() {
+			return nil
+		}
 		cc := cacheControlOpts(objInfo)
 		for fname, fi := range cachedFiles {
 			if cc != nil {
@@ -360,7 +377,7 @@ func (c *diskCache) purge(ctx context.Context) {
 		return nil
 	}
 
-	if err := readDirFilterFn(c.dir, filterFn); err != nil {
+	if err := readDirFn(c.dir, filterFn); err != nil {
 		logger.LogIf(ctx, err)
 		return
 	}
@@ -419,8 +436,8 @@ func (c *diskCache) Stat(ctx context.Context, bucket, object string) (oi ObjectI
 // if partial object is cached.
 func (c *diskCache) statCachedMeta(ctx context.Context, cacheObjPath string) (meta *cacheMeta, partial bool, numHits int, err error) {
 
-	cLock := c.NewNSLockFn(ctx, cacheObjPath)
-	if err = cLock.GetRLock(globalOperationTimeout); err != nil {
+	cLock := c.NewNSLockFn(cacheObjPath)
+	if ctx, err = cLock.GetRLock(ctx, globalOperationTimeout); err != nil {
 		return
 	}
 
@@ -489,9 +506,7 @@ func (c *diskCache) statCache(ctx context.Context, cacheObjPath string) (meta *c
 	}
 	// get metadata of part.1 if full file has been cached.
 	partial = true
-	fi, err := os.Stat(pathJoin(cacheObjPath, cacheDataFile))
-	if err == nil {
-		meta.Stat.ModTime = atime.Get(fi)
+	if _, err := os.Stat(pathJoin(cacheObjPath, cacheDataFile)); err == nil {
 		partial = false
 	}
 	return meta, partial, meta.Hits, nil
@@ -500,9 +515,11 @@ func (c *diskCache) statCache(ctx context.Context, cacheObjPath string) (meta *c
 // saves object metadata to disk cache
 // incHitsOnly is true if metadata update is incrementing only the hit counter
 func (c *diskCache) SaveMetadata(ctx context.Context, bucket, object string, meta map[string]string, actualSize int64, rs *HTTPRangeSpec, rsFileName string, incHitsOnly bool) error {
+	var err error
 	cachedPath := getCacheSHADir(c.dir, bucket, object)
-	cLock := c.NewNSLockFn(ctx, cachedPath)
-	if err := cLock.GetLock(globalOperationTimeout); err != nil {
+	cLock := c.NewNSLockFn(cachedPath)
+	ctx, err = cLock.GetLock(ctx, globalOperationTimeout)
+	if err != nil {
 		return err
 	}
 	defer cLock.Unlock()
@@ -524,7 +541,11 @@ func (c *diskCache) saveMetadata(ctx context.Context, bucket, object string, met
 	}
 	defer f.Close()
 
-	m := &cacheMeta{Version: cacheMetaVersion}
+	m := &cacheMeta{
+		Version: cacheMetaVersion,
+		Bucket:  bucket,
+		Object:  object,
+	}
 	if err := jsonLoad(f, m); err != nil && err != io.EOF {
 		return err
 	}
@@ -538,15 +559,17 @@ func (c *diskCache) saveMetadata(ctx context.Context, bucket, object string, met
 			}
 			m.Ranges[rs.String(actualSize)] = rsFileName
 		}
-	} else {
+	}
+	if rs == nil && !incHitsOnly {
 		// this is necessary cleanup of range files if entire object is cached.
-		for _, f := range m.Ranges {
-			removeAll(pathJoin(cachedPath, f))
+		if _, err := os.Stat(pathJoin(cachedPath, cacheDataFile)); err == nil {
+			for _, f := range m.Ranges {
+				removeAll(pathJoin(cachedPath, f))
+			}
+			m.Ranges = nil
 		}
-		m.Ranges = nil
 	}
 	m.Stat.Size = actualSize
-	m.Stat.ModTime = UTCNow()
 	if !incHitsOnly {
 		// reset meta
 		m.Meta = meta
@@ -558,7 +581,6 @@ func (c *diskCache) saveMetadata(ctx context.Context, bucket, object string, met
 			m.Meta["etag"] = etag
 		}
 	}
-
 	m.Hits++
 
 	m.Checksum = CacheChecksumInfoV1{Algorithm: HighwayHash256S.String(), Blocksize: cacheBlkSize}
@@ -570,22 +592,22 @@ func getCacheSHADir(dir, bucket, object string) string {
 }
 
 // Cache data to disk with bitrot checksum added for each block of 1MB
-func (c *diskCache) bitrotWriteToCache(cachePath, fileName string, reader io.Reader, size uint64) (int64, error) {
+func (c *diskCache) bitrotWriteToCache(cachePath, fileName string, reader io.Reader, size uint64) (int64, string, error) {
 	if err := os.MkdirAll(cachePath, 0777); err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	filePath := pathJoin(cachePath, fileName)
 
 	if filePath == "" || reader == nil {
-		return 0, errInvalidArgument
+		return 0, "", errInvalidArgument
 	}
 
 	if err := checkPathLength(filePath); err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	f, err := os.Create(filePath)
 	if err != nil {
-		return 0, osErrToFileErr(err)
+		return 0, "", osErrToFileErr(err)
 	}
 	defer f.Close()
 
@@ -595,12 +617,12 @@ func (c *diskCache) bitrotWriteToCache(cachePath, fileName string, reader io.Rea
 
 	bufp := c.pool.Get().(*[]byte)
 	defer c.pool.Put(bufp)
-
+	md5Hash := md5.New()
 	var n, n2 int
 	for {
 		n, err = io.ReadFull(reader, *bufp)
 		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
-			return 0, err
+			return 0, "", err
 		}
 		eof := err == io.EOF || err == io.ErrUnexpectedEOF
 		if n == 0 && size != 0 {
@@ -609,21 +631,28 @@ func (c *diskCache) bitrotWriteToCache(cachePath, fileName string, reader io.Rea
 		}
 		h.Reset()
 		if _, err = h.Write((*bufp)[:n]); err != nil {
-			return 0, err
+			return 0, "", err
 		}
 		hashBytes := h.Sum(nil)
+		// compute md5Hash of original data stream if writeback commit to cache
+		if c.commitWriteback {
+			if _, err = md5Hash.Write((*bufp)[:n]); err != nil {
+				return 0, "", err
+			}
+		}
 		if _, err = f.Write(hashBytes); err != nil {
-			return 0, err
+			return 0, "", err
 		}
 		if n2, err = f.Write((*bufp)[:n]); err != nil {
-			return 0, err
+			return 0, "", err
 		}
 		bytesWritten += int64(n2)
 		if eof {
 			break
 		}
 	}
-	return bytesWritten, nil
+
+	return bytesWritten, base64.StdEncoding.EncodeToString(md5Hash.Sum(nil)), nil
 }
 
 func newCacheEncryptReader(content io.Reader, bucket, object string, metadata map[string]string) (r io.Reader, err error) {
@@ -660,41 +689,42 @@ func newCacheEncryptMetadata(bucket, object string, metadata map[string]string) 
 }
 
 // Caches the object to disk
-func (c *diskCache) Put(ctx context.Context, bucket, object string, data io.Reader, size int64, rs *HTTPRangeSpec, opts ObjectOptions, incHitsOnly bool) error {
+func (c *diskCache) Put(ctx context.Context, bucket, object string, data io.Reader, size int64, rs *HTTPRangeSpec, opts ObjectOptions, incHitsOnly bool) (oi ObjectInfo, err error) {
 	if !c.diskSpaceAvailable(size) {
 		io.Copy(ioutil.Discard, data)
-		return errDiskFull
+		return oi, errDiskFull
 	}
 	cachePath := getCacheSHADir(c.dir, bucket, object)
-	cLock := c.NewNSLockFn(ctx, cachePath)
-	if err := cLock.GetLock(globalOperationTimeout); err != nil {
-		return err
+	cLock := c.NewNSLockFn(cachePath)
+	ctx, err = cLock.GetLock(ctx, globalOperationTimeout)
+	if err != nil {
+		return oi, err
 	}
 	defer cLock.Unlock()
 
 	meta, _, numHits, err := c.statCache(ctx, cachePath)
 	// Case where object not yet cached
-	if os.IsNotExist(err) && c.after >= 1 {
-		return c.saveMetadata(ctx, bucket, object, opts.UserDefined, size, nil, "", false)
+	if osIsNotExist(err) && c.after >= 1 {
+		return oi, c.saveMetadata(ctx, bucket, object, opts.UserDefined, size, nil, "", false)
 	}
 	// Case where object already has a cache metadata entry but not yet cached
 	if err == nil && numHits < c.after {
 		cETag := extractETag(meta.Meta)
 		bETag := extractETag(opts.UserDefined)
 		if cETag == bETag {
-			return c.saveMetadata(ctx, bucket, object, opts.UserDefined, size, nil, "", false)
+			return oi, c.saveMetadata(ctx, bucket, object, opts.UserDefined, size, nil, "", false)
 		}
 		incHitsOnly = true
 	}
 
 	if rs != nil {
-		return c.putRange(ctx, bucket, object, data, size, rs, opts)
+		return oi, c.putRange(ctx, bucket, object, data, size, rs, opts)
 	}
 	if !c.diskSpaceAvailable(size) {
-		return errDiskFull
+		return oi, errDiskFull
 	}
 	if err := os.MkdirAll(cachePath, 0777); err != nil {
-		return err
+		return oi, err
 	}
 	var metadata = cloneMSS(opts.UserDefined)
 	var reader = data
@@ -702,25 +732,39 @@ func (c *diskCache) Put(ctx context.Context, bucket, object string, data io.Read
 	if globalCacheKMS != nil {
 		reader, err = newCacheEncryptReader(data, bucket, object, metadata)
 		if err != nil {
-			return err
+			return oi, err
 		}
 		actualSize, _ = sio.EncryptedSize(uint64(size))
 	}
-	n, err := c.bitrotWriteToCache(cachePath, cacheDataFile, reader, actualSize)
+	n, md5sum, err := c.bitrotWriteToCache(cachePath, cacheDataFile, reader, actualSize)
 	if IsErr(err, baseErrs...) {
 		// take the cache drive offline
 		c.setOffline()
 	}
 	if err != nil {
 		removeAll(cachePath)
-		return err
+		return oi, err
 	}
 
 	if actualSize != uint64(n) {
 		removeAll(cachePath)
-		return IncompleteBody{Bucket: bucket, Object: object}
+		return oi, IncompleteBody{Bucket: bucket, Object: object}
 	}
-	return c.saveMetadata(ctx, bucket, object, metadata, n, nil, "", incHitsOnly)
+	if c.commitWriteback {
+		metadata["content-md5"] = md5sum
+		if md5bytes, err := base64.StdEncoding.DecodeString(md5sum); err == nil {
+			metadata["etag"] = hex.EncodeToString(md5bytes)
+		}
+		metadata[writeBackStatusHeader] = CommitPending.String()
+	}
+	return ObjectInfo{
+			Bucket:      bucket,
+			Name:        object,
+			ETag:        metadata["etag"],
+			Size:        n,
+			UserDefined: metadata,
+		},
+		c.saveMetadata(ctx, bucket, object, metadata, n, nil, "", incHitsOnly)
 }
 
 // Caches the range to disk
@@ -751,7 +795,7 @@ func (c *diskCache) putRange(ctx context.Context, bucket, object string, data io
 
 	}
 	cacheFile := MustGetUUID()
-	n, err := c.bitrotWriteToCache(cachePath, cacheFile, reader, actualSize)
+	n, _, err := c.bitrotWriteToCache(cachePath, cacheFile, reader, actualSize)
 	if IsErr(err, baseErrs...) {
 		// take the cache drive offline
 		c.setOffline()
@@ -866,8 +910,9 @@ func (c *diskCache) bitrotReadFromCache(ctx context.Context, filePath string, of
 // Get returns ObjectInfo and reader for object from disk cache
 func (c *diskCache) Get(ctx context.Context, bucket, object string, rs *HTTPRangeSpec, h http.Header, opts ObjectOptions) (gr *GetObjectReader, numHits int, err error) {
 	cacheObjPath := getCacheSHADir(c.dir, bucket, object)
-	cLock := c.NewNSLockFn(ctx, cacheObjPath)
-	if err := cLock.GetRLock(globalOperationTimeout); err != nil {
+	cLock := c.NewNSLockFn(cacheObjPath)
+	ctx, err = cLock.GetRLock(ctx, globalOperationTimeout)
+	if err != nil {
 		return nil, numHits, err
 	}
 
@@ -918,7 +963,7 @@ func (c *diskCache) Get(ctx context.Context, bucket, object string, rs *HTTPRang
 	}
 	if globalCacheKMS != nil {
 		// clean up internal SSE cache metadata
-		delete(gr.ObjInfo.UserDefined, crypto.SSEHeader)
+		delete(gr.ObjInfo.UserDefined, xhttp.AmzServerSideEncryption)
 	}
 	if !rngInfo.Empty() {
 		// overlay Size with actual object size and not the range size
@@ -930,8 +975,9 @@ func (c *diskCache) Get(ctx context.Context, bucket, object string, rs *HTTPRang
 
 // Deletes the cached object
 func (c *diskCache) delete(ctx context.Context, cacheObjPath string) (err error) {
-	cLock := c.NewNSLockFn(ctx, cacheObjPath)
-	if err := cLock.GetLock(globalOperationTimeout); err != nil {
+	cLock := c.NewNSLockFn(cacheObjPath)
+	_, err = cLock.GetLock(ctx, globalOperationTimeout)
+	if err != nil {
 		return err
 	}
 	defer cLock.Unlock()
@@ -950,4 +996,37 @@ func (c *diskCache) Exists(ctx context.Context, bucket, object string) bool {
 		return false
 	}
 	return true
+}
+
+// queues writeback upload failures on server startup
+func (c *diskCache) scanCacheWritebackFailures(ctx context.Context) {
+	defer close(c.retryWritebackCh)
+	filterFn := func(name string, typ os.FileMode) error {
+		if name == minioMetaBucket {
+			// Proceed to next file.
+			return nil
+		}
+		cacheDir := pathJoin(c.dir, name)
+		meta, _, _, err := c.statCachedMeta(ctx, cacheDir)
+		if err != nil {
+			return nil
+		}
+
+		objInfo := meta.ToObjectInfo("", "")
+		status, ok := objInfo.UserDefined[writeBackStatusHeader]
+		if !ok || status == CommitComplete.String() {
+			return nil
+		}
+		select {
+		case c.retryWritebackCh <- objInfo:
+		default:
+		}
+
+		return nil
+	}
+
+	if err := readDirFn(c.dir, filterFn); err != nil {
+		logger.LogIf(ctx, err)
+		return
+	}
 }

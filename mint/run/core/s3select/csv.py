@@ -19,9 +19,12 @@ import io
 import os
 
 from minio import Minio
-from minio.select.options import (CSVInput, CSVOutput, InputSerialization,
-                                  JSONOutput, OutputSerialization,
-                                  RequestProgress, SelectObjectOptions)
+from minio.select import (COMPRESSION_TYPE_NONE, FILE_HEADER_INFO_NONE,
+                          JSON_TYPE_DOCUMENT, QUOTE_FIELDS_ALWAYS,
+                          QUOTE_FIELDS_ASNEEDED, CSVInputSerialization,
+                          CSVOutputSerialization, JSONInputSerialization,
+                          JSONOutputSerialization, SelectRequest)
+
 from utils import *
 
 
@@ -37,7 +40,7 @@ def test_sql_api(test_name, client, bucket_name, input_data, sql_opts, expected_
         # Get the records
         records = io.BytesIO()
         for d in data.stream(10*1024):
-            records.write(d.encode('utf-8'))
+            records.write(d)
             got_output = records.getvalue()
     except Exception as select_err:
         if not isinstance(expected_output, Exception):
@@ -93,26 +96,22 @@ def test_csv_input_custom_quote_char(client, log_output):
 
     try:
         for idx, (quote_char, escape_char, data, expected_output) in enumerate(tests):
-            sql_opts = SelectObjectOptions(
-                expression="select * from s3object",
-                input_serialization=InputSerialization(
-                    compression_type="NONE",
-                    csv=CSVInput(file_header_info="NONE",
-                                 record_delimiter="\n",
-                                 field_delimiter=",",
-                                 quote_character=quote_char,
-                                 quote_escape_character=escape_char,
-                                 comments="#",
-                                 allow_quoted_record_delimiter="FALSE",),
+            sql_opts = SelectRequest(
+                "select * from s3object",
+                CSVInputSerialization(
+                    compression_type=COMPRESSION_TYPE_NONE,
+                    file_header_info=FILE_HEADER_INFO_NONE,
+                    record_delimiter="\n",
+                    field_delimiter=",",
+                    quote_character=quote_char,
+                    quote_escape_character=escape_char,
+                    comments="#",
+                    allow_quoted_record_delimiter="FALSE",
                 ),
-                output_serialization=OutputSerialization(
-                    json=JSONOutput(
-                        record_delimiter="\n",
-                    )
+                JSONOutputSerialization(
+                    record_delimiter="\n",
                 ),
-                request_progress=RequestProgress(
-                    enabled="False"
-                )
+                request_progress=False,
             )
 
             test_sql_api(f'test_{idx}', client, bucket_name,
@@ -150,30 +149,26 @@ def test_csv_output_custom_quote_char(client, log_output):
 
     try:
         for idx, (quote_char, escape_char, input_data, expected_output) in enumerate(tests):
-            sql_opts = SelectObjectOptions(
-                expression="select * from s3object",
-                input_serialization=InputSerialization(
-                    compression_type="NONE",
-                    csv=CSVInput(file_header_info="NONE",
-                                 record_delimiter="\n",
-                                 field_delimiter=",",
-                                 quote_character='"',
-                                 quote_escape_character='"',
-                                 comments="#",
-                                 allow_quoted_record_delimiter="FALSE",
-                                 ),
+            sql_opts = SelectRequest(
+                "select * from s3object",
+                CSVInputSerialization(
+                    compression_type=COMPRESSION_TYPE_NONE,
+                    file_header_info=FILE_HEADER_INFO_NONE,
+                    record_delimiter="\n",
+                    field_delimiter=",",
+                    quote_character='"',
+                    quote_escape_character='"',
+                    comments="#",
+                    allow_quoted_record_delimiter="FALSE",
                 ),
-                output_serialization=OutputSerialization(
-                    csv=CSVOutput(quote_fields="ALWAYS",
-                                  record_delimiter="\n",
-                                  field_delimiter=",",
-                                  quote_character=quote_char,
-                                  quote_escape_character=escape_char,
-                                  )
+                CSVOutputSerialization(
+                    quote_fields=QUOTE_FIELDS_ALWAYS,
+                    record_delimiter="\n",
+                    field_delimiter=",",
+                    quote_character=quote_char,
+                    quote_escape_character=escape_char,
                 ),
-                request_progress=RequestProgress(
-                    enabled="False"
-                )
+                request_progress=False,
             )
 
             test_sql_api(f'test_{idx}', client, bucket_name,

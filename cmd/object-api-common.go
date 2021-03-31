@@ -18,20 +18,25 @@ package cmd
 
 import (
 	"context"
+	"strings"
 	"sync"
 
-	"strings"
-
 	humanize "github.com/dustin/go-humanize"
-	"github.com/minio/minio/cmd/logger"
+	"github.com/minio/minio/pkg/sync/errgroup"
 )
 
 const (
 	// Block size used for all internal operations version 1.
+
+	// TLDR..
+	// Not used anymore xl.meta captures the right blockSize
+	// so blockSizeV2 should be used for all future purposes.
+	// this value is kept here to calculate the max API
+	// requests based on RAM size for existing content.
 	blockSizeV1 = 10 * humanize.MiByte
 
-	// Staging buffer read size for all internal operations version 1.
-	readSizeV1 = 1 * humanize.MiByte
+	// Block size used in erasure coding version 2.
+	blockSizeV2 = 1 * humanize.MiByte
 
 	// Buckets meta prefix.
 	bucketMetaPrefix = "buckets"
@@ -56,27 +61,16 @@ func isObjectDir(object string, size int64) bool {
 	return HasSuffix(object, SlashSeparator) && size == 0
 }
 
-// Converts just bucket, object metadata into ObjectInfo datatype.
-func dirObjectInfo(bucket, object string, size int64, metadata map[string]string) ObjectInfo {
-	// This is a special case with size as '0' and object ends with
-	// a slash separator, we treat it like a valid operation and
-	// return success.
-	etag := metadata["etag"]
-	delete(metadata, "etag")
-	if etag == "" {
-		etag = emptyETag
+func newStorageAPIWithoutHealthCheck(endpoint Endpoint) (storage StorageAPI, err error) {
+	if endpoint.IsLocal {
+		storage, err := newXLStorage(endpoint)
+		if err != nil {
+			return nil, err
+		}
+		return newXLStorageDiskIDCheck(storage), nil
 	}
 
-	return ObjectInfo{
-		Bucket:      bucket,
-		Name:        object,
-		ModTime:     UTCNow(),
-		ContentType: "application/octet-stream",
-		IsDir:       true,
-		Size:        size,
-		ETag:        etag,
-		UserDefined: metadata,
-	}
+	return newStorageRESTClient(endpoint, false), nil
 }
 
 // Depending on the disk type network or local, initialize storage API.
@@ -86,57 +80,10 @@ func newStorageAPI(endpoint Endpoint) (storage StorageAPI, err error) {
 		if err != nil {
 			return nil, err
 		}
-		return &xlStorageDiskIDCheck{storage: storage}, nil
+		return newXLStorageDiskIDCheck(storage), nil
 	}
 
-	return newStorageRESTClient(endpoint), nil
-}
-
-// Cleanup a directory recursively.
-func cleanupDir(ctx context.Context, storage StorageAPI, volume, dirPath string) error {
-	var delFunc func(string) error
-	// Function to delete entries recursively.
-	delFunc = func(entryPath string) error {
-		if !HasSuffix(entryPath, SlashSeparator) {
-			// Delete the file entry.
-			err := storage.DeleteFile(ctx, volume, entryPath)
-			if err != errDiskNotFound && err != errUnformattedDisk {
-				logger.LogIf(ctx, err)
-			}
-			return err
-		}
-
-		// If it's a directory, list and call delFunc() for each entry.
-		entries, err := storage.ListDir(ctx, volume, entryPath, -1)
-		// If entryPath prefix never existed, safe to ignore.
-		if err == errFileNotFound {
-			return nil
-		} else if err != nil { // For any other errors fail.
-			if err != errDiskNotFound && err != errUnformattedDisk {
-				logger.LogIf(ctx, err)
-			}
-			return err
-		} // else on success..
-
-		// Entry path is empty, just delete it.
-		if len(entries) == 0 {
-			err = storage.DeleteFile(ctx, volume, entryPath)
-			if err != errDiskNotFound && err != errUnformattedDisk {
-				logger.LogIf(ctx, err)
-			}
-			return err
-		}
-
-		// Recurse and delete all other entries.
-		for _, entry := range entries {
-			if err = delFunc(pathJoin(entryPath, entry)); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-	err := delFunc(retainSlash(pathJoin(dirPath)))
-	return err
+	return newStorageRESTClient(endpoint, true), nil
 }
 
 func listObjectsNonSlash(ctx context.Context, bucket, prefix, marker, delimiter string, maxKeys int, tpool *TreeWalkPool, listDir ListDirFunc, isLeaf IsLeafFunc, isLeafDir IsLeafDirFunc, getObjInfo func(context.Context, string, string) (ObjectInfo, error), getObjectInfoDirs ...func(context.Context, string, string) (ObjectInfo, error)) (loi ListObjectsInfo, err error) {
@@ -325,58 +272,83 @@ func listObjects(ctx context.Context, obj ObjectLayer, bucket, prefix, marker, d
 		walkResultCh = startTreeWalk(ctx, bucket, prefix, marker, recursive, listDir, isLeaf, isLeafDir, endWalkCh)
 	}
 
-	var objInfos []ObjectInfo
 	var eof bool
 	var nextMarker string
 
 	// List until maxKeys requested.
-	for i := 0; i < maxKeys; {
+	g := errgroup.WithNErrs(maxKeys).WithConcurrency(10)
+	ctx, cancel := g.WithCancelOnError(ctx)
+	defer cancel()
+
+	objInfoFound := make([]*ObjectInfo, maxKeys)
+	var i int
+	for i = 0; i < maxKeys; i++ {
+		i := i
 		walkResult, ok := <-walkResultCh
 		if !ok {
 			// Closed channel.
 			eof = true
-			break
 		}
 
-		var objInfo ObjectInfo
-		var err error
 		if HasSuffix(walkResult.entry, SlashSeparator) {
-			for _, getObjectInfoDir := range getObjectInfoDirs {
-				objInfo, err = getObjectInfoDir(ctx, bucket, walkResult.entry)
-				if err == nil {
-					break
-				}
-				if err == errFileNotFound {
-					err = nil
-					objInfo = ObjectInfo{
-						Bucket: bucket,
-						Name:   walkResult.entry,
-						IsDir:  true,
+			g.Go(func() error {
+				for _, getObjectInfoDir := range getObjectInfoDirs {
+					objInfo, err := getObjectInfoDir(ctx, bucket, walkResult.entry)
+					if err == nil {
+						objInfoFound[i] = &objInfo
+						// Done...
+						return nil
 					}
+
+					// Add temp, may be overridden,
+					if err == errFileNotFound {
+						objInfoFound[i] = &ObjectInfo{
+							Bucket: bucket,
+							Name:   walkResult.entry,
+							IsDir:  true,
+						}
+						continue
+					}
+					return toObjectErr(err, bucket, prefix)
 				}
-			}
+				return nil
+			}, i)
 		} else {
-			objInfo, err = getObjInfo(ctx, bucket, walkResult.entry)
+			g.Go(func() error {
+				objInfo, err := getObjInfo(ctx, bucket, walkResult.entry)
+				if err != nil {
+					// Ignore errFileNotFound as the object might have got
+					// deleted in the interim period of listing and getObjectInfo(),
+					// ignore quorum error as it might be an entry from an outdated disk.
+					if IsErrIgnored(err, []error{
+						errFileNotFound,
+						errErasureReadQuorum,
+					}...) {
+						return nil
+					}
+					return toObjectErr(err, bucket, prefix)
+				}
+				objInfoFound[i] = &objInfo
+				return nil
+			}, i)
 		}
-		if err != nil {
-			// Ignore errFileNotFound as the object might have got
-			// deleted in the interim period of listing and getObjectInfo(),
-			// ignore quorum error as it might be an entry from an outdated disk.
-			if IsErrIgnored(err, []error{
-				errFileNotFound,
-				errErasureReadQuorum,
-			}...) {
-				continue
-			}
-			return loi, toObjectErr(err, bucket, prefix)
-		}
-		nextMarker = objInfo.Name
-		objInfos = append(objInfos, objInfo)
+
 		if walkResult.end {
 			eof = true
 			break
 		}
-		i++
+	}
+	if err := g.WaitErr(); err != nil {
+		return loi, err
+	}
+	// Copy found objects
+	objInfos := make([]ObjectInfo, 0, i+1)
+	for _, objInfo := range objInfoFound {
+		if objInfo == nil {
+			continue
+		}
+		objInfos = append(objInfos, *objInfo)
+		nextMarker = objInfo.Name
 	}
 
 	// Save list routine for the next marker if we haven't reached EOF.

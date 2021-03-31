@@ -116,9 +116,9 @@ func NewKes(cfg KesConfig) (KMS, error) {
 	if err != nil {
 		return nil, err
 	}
-	if cfg.Transport.TLSClientConfig != nil {
-		if err = loadCACertificates(cfg.CAPath,
-			cfg.Transport.TLSClientConfig.RootCAs); err != nil {
+
+	if cfg.Transport.TLSClientConfig != nil && cfg.Transport.TLSClientConfig.RootCAs != nil {
+		if err = loadCACertificates(cfg.CAPath, cfg.Transport.TLSClientConfig.RootCAs); err != nil {
 			return nil, err
 		}
 	} else {
@@ -132,8 +132,12 @@ func NewKes(cfg KesConfig) (KMS, error) {
 		if err = loadCACertificates(cfg.CAPath, rootCAs); err != nil {
 			return nil, err
 		}
-		cfg.Transport.TLSClientConfig = &tls.Config{
-			RootCAs: rootCAs,
+		if cfg.Transport.TLSClientConfig == nil {
+			cfg.Transport.TLSClientConfig = &tls.Config{
+				RootCAs: rootCAs,
+			}
+		} else {
+			cfg.Transport.TLSClientConfig.RootCAs = rootCAs
 		}
 	}
 	cfg.Transport.TLSClientConfig.Certificates = []tls.Certificate{cert}
@@ -177,11 +181,13 @@ func (kes *kesService) CreateKey(keyID string) error { return kes.client.CreateK
 // named key referenced by keyID. It also binds the generated key
 // cryptographically to the provided context.
 func (kes *kesService) GenerateKey(keyID string, ctx Context) (key [32]byte, sealedKey []byte, err error) {
-	var context bytes.Buffer
-	ctx.WriteTo(&context)
+	context, err := ctx.MarshalText()
+	if err != nil {
+		return key, nil, err
+	}
 
 	var plainKey []byte
-	plainKey, sealedKey, err = kes.client.GenerateDataKey(keyID, context.Bytes())
+	plainKey, sealedKey, err = kes.client.GenerateDataKey(keyID, context)
 	if err != nil {
 		return key, nil, err
 	}
@@ -200,11 +206,13 @@ func (kes *kesService) GenerateKey(keyID string, ctx Context) (key [32]byte, sea
 // The context must be same context as the one provided while
 // generating the plaintext key / sealedKey.
 func (kes *kesService) UnsealKey(keyID string, sealedKey []byte, ctx Context) (key [32]byte, err error) {
-	var context bytes.Buffer
-	ctx.WriteTo(&context)
+	context, err := ctx.MarshalText()
+	if err != nil {
+		return key, err
+	}
 
 	var plainKey []byte
-	plainKey, err = kes.client.DecryptDataKey(keyID, sealedKey, context.Bytes())
+	plainKey, err = kes.client.DecryptDataKey(keyID, sealedKey, context)
 	if err != nil {
 		return key, err
 	}
@@ -415,7 +423,7 @@ func (c *kesClient) postRetry(path string, body io.ReadSeeker, limit int64) (io.
 		}
 
 		// If the error is not temp. / retryable => fail the request immediately.
-		if !xnet.IsNetworkOrHostDown(err) &&
+		if !xnet.IsNetworkOrHostDown(err, false) &&
 			!errors.Is(err, io.EOF) &&
 			!errors.Is(err, io.ErrUnexpectedEOF) &&
 			!errors.Is(err, context.DeadlineExceeded) {

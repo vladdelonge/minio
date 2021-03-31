@@ -19,13 +19,12 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"errors"
-	"fmt"
 	"io"
 	"sort"
 
 	"github.com/minio/minio/cmd/logger"
-	sha256 "github.com/minio/sha256-simd"
 	"github.com/minio/sio"
 )
 
@@ -33,38 +32,50 @@ import (
 // associated with a certain object.
 type Context map[string]string
 
-// WriteTo writes the context in a canonical from to w.
-// It returns the number of bytes and the first error
-// encounter during writing to w, if any.
-//
-// WriteTo sorts the context keys and writes the sorted
-// key-value pairs as canonical JSON object to w.
-func (c Context) WriteTo(w io.Writer) (n int64, err error) {
-	sortedKeys := make(sort.StringSlice, 0, len(c))
+// MarshalText returns a canonical text representation of
+// the Context.
+
+// MarshalText sorts the context keys and writes the sorted
+// key-value pairs as canonical JSON object. The sort order
+// is based on the un-escaped keys.
+func (c Context) MarshalText() ([]byte, error) {
+	if len(c) == 0 {
+		return []byte{'{', '}'}, nil
+	}
+
+	// Pre-allocate a buffer - 128 bytes is an arbitrary
+	// heuristic value that seems like a good starting size.
+	var b = bytes.NewBuffer(make([]byte, 0, 128))
+	if len(c) == 1 {
+		for k, v := range c {
+			b.WriteString(`{"`)
+			EscapeStringJSON(b, k)
+			b.WriteString(`":"`)
+			EscapeStringJSON(b, v)
+			b.WriteString(`"}`)
+		}
+		return b.Bytes(), nil
+	}
+
+	sortedKeys := make([]string, 0, len(c))
 	for k := range c {
 		sortedKeys = append(sortedKeys, k)
 	}
-	sort.Sort(sortedKeys)
+	sort.Strings(sortedKeys)
 
-	nn, err := io.WriteString(w, "{")
-	if err != nil {
-		return n + int64(nn), err
-	}
-	n += int64(nn)
+	b.WriteByte('{')
 	for i, k := range sortedKeys {
-		s := fmt.Sprintf("\"%s\":\"%s\",", k, c[k])
-		if i == len(sortedKeys)-1 {
-			s = s[:len(s)-1] // remove last ','
+		b.WriteByte('"')
+		EscapeStringJSON(b, k)
+		b.WriteString(`":"`)
+		EscapeStringJSON(b, c[k])
+		b.WriteByte('"')
+		if i < len(sortedKeys)-1 {
+			b.WriteByte(',')
 		}
-
-		nn, err = io.WriteString(w, s)
-		if err != nil {
-			return n + int64(nn), err
-		}
-		n += int64(nn)
 	}
-	nn, err = io.WriteString(w, "}")
-	return n + int64(nn), err
+	b.WriteByte('}')
+	return b.Bytes(), nil
 }
 
 // KMS represents an active and authenticted connection
@@ -155,13 +166,12 @@ func (kms *masterKeyKMS) Info() (info KMSInfo) {
 
 func (kms *masterKeyKMS) UnsealKey(keyID string, sealedKey []byte, ctx Context) (key [32]byte, err error) {
 	var (
-		buffer     bytes.Buffer
 		derivedKey = kms.deriveKey(keyID, ctx)
 	)
-	if n, err := sio.Decrypt(&buffer, bytes.NewReader(sealedKey), sio.Config{Key: derivedKey[:]}); err != nil || n != 32 {
+	out, err := sio.DecryptBuffer(key[:0], sealedKey, sio.Config{Key: derivedKey[:]})
+	if err != nil || len(out) != 32 {
 		return key, err // TODO(aead): upgrade sio to use sio.Error
 	}
-	copy(key[:], buffer.Bytes())
 	return key, nil
 }
 
@@ -169,9 +179,11 @@ func (kms *masterKeyKMS) deriveKey(keyID string, context Context) (key [32]byte)
 	if context == nil {
 		context = Context{}
 	}
+	ctxBytes, _ := context.MarshalText()
+
 	mac := hmac.New(sha256.New, kms.masterKey[:])
 	mac.Write([]byte(keyID))
-	context.WriteTo(mac)
+	mac.Write(ctxBytes)
 	mac.Sum(key[:0])
 	return key
 }

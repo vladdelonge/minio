@@ -20,13 +20,10 @@ import (
 	"encoding/json"
 	"io"
 	"io/ioutil"
-	"net"
 	"net/http"
 
 	"github.com/gorilla/mux"
-	"github.com/minio/minio/cmd/config"
 	"github.com/minio/minio/cmd/logger"
-	"github.com/minio/minio/pkg/env"
 	iampolicy "github.com/minio/minio/pkg/iam/policy"
 	"github.com/minio/minio/pkg/madmin"
 )
@@ -44,7 +41,7 @@ const (
 func (a adminAPIHandlers) PutBucketQuotaConfigHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, w, "PutBucketQuotaConfig")
 
-	defer logger.AuditLog(w, r, "PutBucketQuotaConfig", mustGetClaimsFromToken(r))
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 
 	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.SetBucketQuotaAdminAction)
 	if objectAPI == nil {
@@ -54,12 +51,6 @@ func (a adminAPIHandlers) PutBucketQuotaConfigHandler(w http.ResponseWriter, r *
 
 	vars := mux.Vars(r)
 	bucket := vars["bucket"]
-
-	// Turn off quota commands if data usage info is unavailable.
-	if env.Get(envDataUsageCrawlConf, config.EnableOn) == config.EnableOff {
-		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAdminBucketQuotaDisabled), r.URL)
-		return
-	}
 
 	if _, err := objectAPI.GetBucketInfo(ctx, bucket); err != nil {
 		writeErrorResponseJSON(ctx, w, toAPIError(ctx, err), r.URL)
@@ -90,7 +81,7 @@ func (a adminAPIHandlers) PutBucketQuotaConfigHandler(w http.ResponseWriter, r *
 func (a adminAPIHandlers) GetBucketQuotaConfigHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, w, "GetBucketQuotaConfig")
 
-	defer logger.AuditLog(w, r, "GetBucketQuotaConfig", mustGetClaimsFromToken(r))
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 
 	objectAPI, _ := validateAdminUsersReq(ctx, w, r, iampolicy.GetBucketQuotaAdminAction)
 	if objectAPI == nil {
@@ -125,18 +116,20 @@ func (a adminAPIHandlers) GetBucketQuotaConfigHandler(w http.ResponseWriter, r *
 func (a adminAPIHandlers) SetRemoteTargetHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, w, "SetBucketTarget")
 
-	defer logger.AuditLog(w, r, "SetBucketTarget", mustGetClaimsFromToken(r))
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 	vars := mux.Vars(r)
 	bucket := vars["bucket"]
+	update := r.URL.Query().Get("update") == "true"
+
+	if !globalIsErasure {
+		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrNotImplemented), r.URL)
+		return
+	}
 
 	// Get current object layer instance.
 	objectAPI, _ := validateAdminUsersReq(ctx, w, r, iampolicy.SetBucketTargetAction)
 	if objectAPI == nil {
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrServerNotInitialized), r.URL)
-		return
-	}
-	if !globalIsErasure {
-		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrNotImplemented), r.URL)
 		return
 	}
 
@@ -163,38 +156,40 @@ func (a adminAPIHandlers) SetRemoteTargetHandler(w http.ResponseWriter, r *http.
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErrWithErr(ErrAdminConfigBadJSON, err), r.URL)
 		return
 	}
-	host, port, err := net.SplitHostPort(target.Endpoint)
-	if err != nil {
-		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErrWithErr(ErrAdminConfigBadJSON, err), r.URL)
-		return
-	}
-	sameTarget, _ := isLocalHost(host, port, globalMinioPort)
+	sameTarget, _ := isLocalHost(target.URL().Hostname(), target.URL().Port(), globalMinioPort)
 	if sameTarget && bucket == target.TargetBucket {
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrBucketRemoteIdenticalToSource), r.URL)
 		return
 	}
+
 	target.SourceBucket = bucket
-	target.Arn = globalBucketTargetSys.getRemoteARN(bucket, &target)
+	if !update {
+		target.Arn = globalBucketTargetSys.getRemoteARN(bucket, &target)
+	}
 	if target.Arn == "" {
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErrWithErr(ErrAdminConfigBadJSON, err), r.URL)
 		return
 	}
-	if err = globalBucketTargetSys.SetTarget(ctx, bucket, &target); err != nil {
-		writeErrorResponseJSON(ctx, w, toAPIError(ctx, err), r.URL)
+
+	if err = globalBucketTargetSys.SetTarget(ctx, bucket, &target, update); err != nil {
+		switch err.(type) {
+		case BucketRemoteConnectionErr:
+			writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErrWithErr(ErrReplicationRemoteConnectionError, err), r.URL)
+		default:
+			writeErrorResponseJSON(ctx, w, toAPIError(ctx, err), r.URL)
+		}
 		return
 	}
 	targets, err := globalBucketTargetSys.ListBucketTargets(ctx, bucket)
 	if err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL, guessIsBrowserReq(r))
 		return
-
 	}
 	tgtBytes, err := json.Marshal(&targets)
 	if err != nil {
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErrWithErr(ErrAdminConfigBadJSON, err), r.URL)
 		return
 	}
-
 	if err = globalBucketMetadataSys.Update(bucket, bucketTargetsFile, tgtBytes); err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL, guessIsBrowserReq(r))
 		return
@@ -214,11 +209,14 @@ func (a adminAPIHandlers) SetRemoteTargetHandler(w http.ResponseWriter, r *http.
 func (a adminAPIHandlers) ListRemoteTargetsHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, w, "ListBucketTargets")
 
-	defer logger.AuditLog(w, r, "ListBucketTargets", mustGetClaimsFromToken(r))
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 	vars := mux.Vars(r)
 	bucket := vars["bucket"]
 	arnType := vars["type"]
-
+	if !globalIsErasure {
+		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrNotImplemented), r.URL)
+		return
+	}
 	// Get current object layer instance.
 	objectAPI, _ := validateAdminUsersReq(ctx, w, r, iampolicy.GetBucketTargetAction)
 	if objectAPI == nil {
@@ -250,19 +248,19 @@ func (a adminAPIHandlers) ListRemoteTargetsHandler(w http.ResponseWriter, r *htt
 func (a adminAPIHandlers) RemoveRemoteTargetHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, w, "RemoveBucketTarget")
 
-	defer logger.AuditLog(w, r, "RemoveBucketTarget", mustGetClaimsFromToken(r))
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 	vars := mux.Vars(r)
 	bucket := vars["bucket"]
 	arn := vars["arn"]
 
+	if !globalIsErasure {
+		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrNotImplemented), r.URL)
+		return
+	}
 	// Get current object layer instance.
 	objectAPI, _ := validateAdminUsersReq(ctx, w, r, iampolicy.SetBucketTargetAction)
 	if objectAPI == nil {
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrServerNotInitialized), r.URL)
-		return
-	}
-	if !globalIsErasure {
-		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrNotImplemented), r.URL)
 		return
 	}
 

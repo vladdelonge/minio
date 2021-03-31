@@ -40,7 +40,7 @@ const (
 func (api objectAPIHandlers) PutBucketVersioningHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, w, "PutBucketVersioning")
 
-	defer logger.AuditLog(w, r, "PutBucketVersioning", mustGetClaimsFromToken(r))
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 
 	vars := mux.Vars(r)
 	bucket := vars["bucket"]
@@ -70,6 +70,14 @@ func (api objectAPIHandlers) PutBucketVersioningHandler(w http.ResponseWriter, r
 		}, r.URL, guessIsBrowserReq(r))
 		return
 	}
+	if _, err := getReplicationConfig(ctx, bucket); err == nil && v.Suspended() {
+		writeErrorResponse(ctx, w, APIError{
+			Code:           "InvalidBucketState",
+			Description:    "A replication configuration is present on this bucket, so the versioning state cannot be changed.",
+			HTTPStatusCode: http.StatusConflict,
+		}, r.URL, guessIsBrowserReq(r))
+		return
+	}
 
 	configData, err := xml.Marshal(v)
 	if err != nil {
@@ -90,7 +98,7 @@ func (api objectAPIHandlers) PutBucketVersioningHandler(w http.ResponseWriter, r
 func (api objectAPIHandlers) GetBucketVersioningHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, w, "GetBucketVersioning")
 
-	defer logger.AuditLog(w, r, "GetBucketVersioning", mustGetClaimsFromToken(r))
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 
 	vars := mux.Vars(r)
 	bucket := vars["bucket"]

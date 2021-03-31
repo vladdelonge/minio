@@ -39,7 +39,6 @@ import (
 	"github.com/minio/minio/pkg/env"
 	xnet "github.com/minio/minio/pkg/net"
 	"github.com/minio/selfupdate"
-	_ "github.com/minio/sha256-simd" // Needed for sha256 hash verifier.
 )
 
 const (
@@ -131,7 +130,7 @@ func GetCurrentReleaseTime() (releaseTime time.Time, err error) {
 func IsDocker() bool {
 	if env.Get("MINIO_CI_CD", "") == "" {
 		_, err := os.Stat("/.dockerenv")
-		if os.IsNotExist(err) {
+		if osIsNotExist(err) {
 			return false
 		}
 
@@ -174,7 +173,7 @@ func IsKubernetes() bool {
 func IsBOSH() bool {
 	// "/var/vcap/bosh" exists in BOSH deployed instance.
 	_, err := os.Stat("/var/vcap/bosh")
-	if os.IsNotExist(err) {
+	if osIsNotExist(err) {
 		return false
 	}
 
@@ -193,7 +192,7 @@ func getHelmVersion(helmInfoFilePath string) string {
 	if err != nil {
 		// Log errors and return "" as MinIO can be deployed
 		// without Helm charts as well.
-		if !os.IsNotExist(err) {
+		if !osIsNotExist(err) {
 			reqInfo := (&logger.ReqInfo{}).AppendTags("helmInfoFilePath", helmInfoFilePath)
 			ctx := logger.SetReqInfo(GlobalContext, reqInfo)
 			logger.LogIf(ctx, err)
@@ -309,7 +308,7 @@ func downloadReleaseURL(u *url.URL, timeout time.Duration, mode string) (content
 		client := &http.Client{Transport: getUpdateTransport(timeout)}
 		resp, err := client.Do(req)
 		if err != nil {
-			if xnet.IsNetworkOrHostDown(err) {
+			if xnet.IsNetworkOrHostDown(err, false) {
 				return content, AdminError{
 					Code:       AdminUpdateURLNotReachable,
 					Message:    err.Error(),
@@ -501,7 +500,7 @@ func getUpdateReaderFromURL(u *url.URL, transport http.RoundTripper, mode string
 
 	resp, err := clnt.Do(req)
 	if err != nil {
-		if xnet.IsNetworkOrHostDown(err) {
+		if xnet.IsNetworkOrHostDown(err, false) {
 			return nil, AdminError{
 				Code:       AdminUpdateURLNotReachable,
 				Message:    err.Error(),

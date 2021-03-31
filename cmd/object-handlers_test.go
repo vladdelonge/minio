@@ -37,7 +37,6 @@ import (
 	"testing"
 
 	humanize "github.com/dustin/go-humanize"
-	"github.com/minio/minio/cmd/crypto"
 	xhttp "github.com/minio/minio/cmd/http"
 	"github.com/minio/minio/pkg/auth"
 	ioutilx "github.com/minio/minio/pkg/ioutil"
@@ -86,7 +85,7 @@ func testAPIHeadObjectHandler(obj ObjectLayer, instanceType, bucketName string, 
 	// iterate through the above set of inputs and upload the object.
 	for i, input := range putObjectInputs {
 		// uploading the object.
-		_, err := obj.PutObject(context.Background(), input.bucketName, input.objectName, mustGetPutObjReader(t, bytes.NewBuffer(input.textData), input.contentLength, input.metaData[""], ""), ObjectOptions{UserDefined: input.metaData})
+		_, err := obj.PutObject(context.Background(), input.bucketName, input.objectName, mustGetPutObjReader(t, bytes.NewReader(input.textData), input.contentLength, input.metaData[""], ""), ObjectOptions{UserDefined: input.metaData})
 		// if object upload fails stop the test.
 		if err != nil {
 			t.Fatalf("Put Object case %d:  Error uploading object: <ERROR> %v", i+1, err)
@@ -213,17 +212,17 @@ func testAPIHeadObjectHandlerWithEncryption(obj ObjectLayer, instanceType, bucke
 	credentials auth.Credentials, t *testing.T) {
 
 	// Set SSL to on to do encryption tests
-	globalIsSSL = true
-	defer func() { globalIsSSL = false }()
+	globalIsTLS = true
+	defer func() { globalIsTLS = false }()
 
 	var (
 		oneMiB        int64 = 1024 * 1024
 		key32Bytes          = generateBytesData(32 * humanize.Byte)
 		key32BytesMd5       = md5.Sum(key32Bytes)
 		metaWithSSEC        = map[string]string{
-			crypto.SSECAlgorithm: crypto.SSEAlgorithmAES256,
-			crypto.SSECKey:       base64.StdEncoding.EncodeToString(key32Bytes),
-			crypto.SSECKeyMD5:    base64.StdEncoding.EncodeToString(key32BytesMd5[:]),
+			xhttp.AmzServerSideEncryptionCustomerAlgorithm: xhttp.AmzEncryptionAES,
+			xhttp.AmzServerSideEncryptionCustomerKey:       base64.StdEncoding.EncodeToString(key32Bytes),
+			xhttp.AmzServerSideEncryptionCustomerKeyMD5:    base64.StdEncoding.EncodeToString(key32BytesMd5[:]),
 		}
 		mapCopy = func(m map[string]string) map[string]string {
 			r := make(map[string]string, len(m))
@@ -328,7 +327,7 @@ func TestAPIGetObjectHandler(t *testing.T) {
 	defer func() { globalPolicySys = nil }()
 
 	defer DetectTestLeak(t)()
-	ExecObjectLayerAPITest(t, testAPIGetObjectHandler, []string{"GetObject"})
+	ExecExtendedObjectLayerAPITest(t, testAPIGetObjectHandler, []string{"GetObject"})
 }
 
 func testAPIGetObjectHandler(obj ObjectLayer, instanceType, bucketName string, apiRouter http.Handler,
@@ -358,7 +357,7 @@ func testAPIGetObjectHandler(obj ObjectLayer, instanceType, bucketName string, a
 	// iterate through the above set of inputs and upload the object.
 	for i, input := range putObjectInputs {
 		// uploading the object.
-		_, err := obj.PutObject(context.Background(), input.bucketName, input.objectName, mustGetPutObjReader(t, bytes.NewBuffer(input.textData), input.contentLength, input.metaData[""], ""), ObjectOptions{UserDefined: input.metaData})
+		_, err := obj.PutObject(context.Background(), input.bucketName, input.objectName, mustGetPutObjReader(t, bytes.NewReader(input.textData), input.contentLength, input.metaData[""], ""), ObjectOptions{UserDefined: input.metaData})
 		// if object upload fails stop the test.
 		if err != nil {
 			t.Fatalf("Put Object case %d:  Error uploading object: <ERROR> %v", i+1, err)
@@ -652,24 +651,24 @@ func TestAPIGetObjectWithMPHandler(t *testing.T) {
 	defer func() { globalPolicySys = nil }()
 
 	defer DetectTestLeak(t)()
-	ExecObjectLayerAPITest(t, testAPIGetObjectWithMPHandler, []string{"NewMultipart", "PutObjectPart", "CompleteMultipart", "GetObject", "PutObject"})
+	ExecExtendedObjectLayerAPITest(t, testAPIGetObjectWithMPHandler, []string{"NewMultipart", "PutObjectPart", "CompleteMultipart", "GetObject", "PutObject"})
 }
 
 func testAPIGetObjectWithMPHandler(obj ObjectLayer, instanceType, bucketName string, apiRouter http.Handler,
 	credentials auth.Credentials, t *testing.T) {
 
 	// Set SSL to on to do encryption tests
-	globalIsSSL = true
-	defer func() { globalIsSSL = false }()
+	globalIsTLS = true
+	defer func() { globalIsTLS = false }()
 
 	var (
 		oneMiB        int64 = 1024 * 1024
 		key32Bytes          = generateBytesData(32 * humanize.Byte)
 		key32BytesMd5       = md5.Sum(key32Bytes)
 		metaWithSSEC        = map[string]string{
-			crypto.SSECAlgorithm: crypto.SSEAlgorithmAES256,
-			crypto.SSECKey:       base64.StdEncoding.EncodeToString(key32Bytes),
-			crypto.SSECKeyMD5:    base64.StdEncoding.EncodeToString(key32BytesMd5[:]),
+			xhttp.AmzServerSideEncryptionCustomerAlgorithm: xhttp.AmzEncryptionAES,
+			xhttp.AmzServerSideEncryptionCustomerKey:       base64.StdEncoding.EncodeToString(key32Bytes),
+			xhttp.AmzServerSideEncryptionCustomerKeyMD5:    base64.StdEncoding.EncodeToString(key32BytesMd5[:]),
 		}
 		mapCopy = func(m map[string]string) map[string]string {
 			r := make(map[string]string, len(m))
@@ -844,10 +843,141 @@ func testAPIGetObjectWithMPHandler(obj ObjectLayer, instanceType, bucketName str
 
 }
 
+// Wrapper for calling GetObject API handler tests for both Erasure multiple disks and FS single drive setup.
+func TestAPIGetObjectWithPartNumberHandler(t *testing.T) {
+	globalPolicySys = NewPolicySys()
+	defer func() { globalPolicySys = nil }()
+
+	defer DetectTestLeak(t)()
+	ExecExtendedObjectLayerAPITest(t, testAPIGetObjectWithPartNumberHandler, []string{"NewMultipart", "PutObjectPart", "CompleteMultipart", "GetObject", "PutObject"})
+}
+
+func testAPIGetObjectWithPartNumberHandler(obj ObjectLayer, instanceType, bucketName string, apiRouter http.Handler,
+	credentials auth.Credentials, t *testing.T) {
+
+	// Set SSL to on to do encryption tests
+	globalIsTLS = true
+	defer func() { globalIsTLS = false }()
+
+	var (
+		oneMiB        int64 = 1024 * 1024
+		key32Bytes          = generateBytesData(32 * humanize.Byte)
+		key32BytesMd5       = md5.Sum(key32Bytes)
+		metaWithSSEC        = map[string]string{
+			xhttp.AmzServerSideEncryptionCustomerAlgorithm: xhttp.AmzEncryptionAES,
+			xhttp.AmzServerSideEncryptionCustomerKey:       base64.StdEncoding.EncodeToString(key32Bytes),
+			xhttp.AmzServerSideEncryptionCustomerKeyMD5:    base64.StdEncoding.EncodeToString(key32BytesMd5[:]),
+		}
+		mapCopy = func(m map[string]string) map[string]string {
+			r := make(map[string]string, len(m))
+			for k, v := range m {
+				r[k] = v
+			}
+			return r
+		}
+	)
+
+	type ObjectInput struct {
+		objectName  string
+		partLengths []int64
+
+		metaData map[string]string
+	}
+
+	// set of inputs for uploading the objects before tests for
+	// downloading is done. Data bytes are from DummyDataGen.
+	objectInputs := []ObjectInput{
+		// // cases 0-4: small single part objects
+		{"nothing", []int64{0}, make(map[string]string)},
+		{"1byte", []int64{1}, make(map[string]string)},
+		{"small-0", []int64{11}, make(map[string]string)},
+		{"small-1", []int64{509}, make(map[string]string)},
+		{"small-2", []int64{5 * oneMiB}, make(map[string]string)},
+		// // // cases 5-8: multipart part objects
+		{"mp-0", []int64{5 * oneMiB, 1}, make(map[string]string)},
+		{"mp-1", []int64{5*oneMiB + 1, 1}, make(map[string]string)},
+		{"mp-2", []int64{5487701, 5487799, 3}, make(map[string]string)},
+		{"mp-3", []int64{10499807, 10499963, 7}, make(map[string]string)},
+		// cases 9-12: small single part objects with encryption
+		{"enc-nothing", []int64{0}, mapCopy(metaWithSSEC)},
+		{"enc-small-0", []int64{11}, mapCopy(metaWithSSEC)},
+		{"enc-small-1", []int64{509}, mapCopy(metaWithSSEC)},
+		{"enc-small-2", []int64{5 * oneMiB}, mapCopy(metaWithSSEC)},
+		// cases 13-16: multipart part objects with encryption
+		{"enc-mp-0", []int64{5 * oneMiB, 1}, mapCopy(metaWithSSEC)},
+		{"enc-mp-1", []int64{5*oneMiB + 1, 1}, mapCopy(metaWithSSEC)},
+		{"enc-mp-2", []int64{5487701, 5487799, 3}, mapCopy(metaWithSSEC)},
+		{"enc-mp-3", []int64{10499807, 10499963, 7}, mapCopy(metaWithSSEC)},
+	}
+
+	// iterate through the above set of inputs and upload the object.
+	for _, input := range objectInputs {
+		uploadTestObject(t, apiRouter, credentials, bucketName, input.objectName, input.partLengths, input.metaData, false)
+	}
+
+	mkGetReqWithPartNumber := func(oindex int, oi ObjectInput, partNumber int) {
+		object := oi.objectName
+		rec := httptest.NewRecorder()
+
+		queries := url.Values{}
+		queries.Add("partNumber", strconv.Itoa(partNumber))
+		targetURL := makeTestTargetURL("", bucketName, object, queries)
+		req, err := newTestSignedRequestV4(http.MethodGet, targetURL,
+			0, nil, credentials.AccessKey, credentials.SecretKey, oi.metaData)
+		if err != nil {
+			t.Fatalf("Object: %s Object Index %d PartNumber: %d: Failed to create HTTP request for Get Object: <ERROR> %v",
+				object, oindex, partNumber, err)
+		}
+
+		apiRouter.ServeHTTP(rec, req)
+
+		// Check response code (we make only valid requests in this test)
+		if rec.Code != http.StatusPartialContent && rec.Code != http.StatusOK {
+			bd, err1 := ioutil.ReadAll(rec.Body)
+			t.Fatalf("%s Object: %s ObjectIndex %d PartNumber: %d: Got response status `%d` and body: %s,%v",
+				instanceType, object, oindex, partNumber, rec.Code, string(bd), err1)
+		}
+
+		oinfo, err := obj.GetObjectInfo(context.Background(), bucketName, object, ObjectOptions{})
+		if err != nil {
+			t.Fatalf("Object: %s Object Index %d: Unexpected err: %v", object, oindex, err)
+		}
+
+		rs := partNumberToRangeSpec(oinfo, partNumber)
+		size, err := oinfo.GetActualSize()
+		if err != nil {
+			t.Fatalf("Object: %s Object Index %d: Unexpected err: %v", object, oindex, err)
+		}
+
+		off, length, err := rs.GetOffsetLength(size)
+		if err != nil {
+			t.Fatalf("Object: %s Object Index %d: Unexpected err: %v", object, oindex, err)
+		}
+
+		readers := []io.Reader{}
+		cumulativeSum := int64(0)
+		for _, p := range oi.partLengths {
+			readers = append(readers, NewDummyDataGen(p, cumulativeSum))
+			cumulativeSum += p
+		}
+
+		refReader := io.LimitReader(ioutilx.NewSkipReader(io.MultiReader(readers...), off), length)
+		if ok, msg := cmpReaders(refReader, rec.Body); !ok {
+			t.Fatalf("(%s) Object: %s ObjectIndex %d PartNumber: %d --> data mismatch! (msg: %s)", instanceType, oi.objectName, oindex, partNumber, msg)
+		}
+	}
+
+	for idx, oi := range objectInputs {
+		for partNum := 1; partNum <= len(oi.partLengths); partNum++ {
+			mkGetReqWithPartNumber(idx, oi, partNum)
+		}
+	}
+}
+
 // Wrapper for calling PutObject API handler tests using streaming signature v4 for both Erasure multiple disks and FS single drive setup.
 func TestAPIPutObjectStreamSigV4Handler(t *testing.T) {
 	defer DetectTestLeak(t)()
-	ExecObjectLayerAPITest(t, testAPIPutObjectStreamSigV4Handler, []string{"PutObject"})
+	ExecExtendedObjectLayerAPITest(t, testAPIPutObjectStreamSigV4Handler, []string{"PutObject"})
 }
 
 func testAPIPutObjectStreamSigV4Handler(obj ObjectLayer, instanceType, bucketName string, apiRouter http.Handler,
@@ -1123,8 +1253,8 @@ func testAPIPutObjectStreamSigV4Handler(obj ObjectLayer, instanceType, bucketNam
 		apiRouter.ServeHTTP(rec, req)
 		// Assert the response code with the expected status.
 		if rec.Code != testCase.expectedRespStatus {
-			t.Errorf("Test %d %s: Expected the response status to be `%d`, but instead found `%d`",
-				i+1, instanceType, testCase.expectedRespStatus, rec.Code)
+			t.Errorf("Test %d %s: Expected the response status to be `%d`, but instead found `%d`: fault case %d",
+				i+1, instanceType, testCase.expectedRespStatus, rec.Code, testCase.fault)
 		}
 		// read the response body.
 		actualContent, err := ioutil.ReadAll(rec.Body)
@@ -1150,14 +1280,18 @@ func testAPIPutObjectStreamSigV4Handler(obj ObjectLayer, instanceType, bucketNam
 				t.Fatalf("Test %d: %s: ContentEncoding is set to \"%s\" which is unexpected, expected \"%s\"", i+1, instanceType, objInfo.ContentEncoding, expectedContentEncoding)
 			}
 			buffer := new(bytes.Buffer)
-			err = obj.GetObject(context.Background(), testCase.bucketName, testCase.objectName, 0, int64(testCase.dataLen), buffer, objInfo.ETag, opts)
+			r, err := obj.GetObjectNInfo(context.Background(), testCase.bucketName, testCase.objectName, nil, nil, readLock, opts)
 			if err != nil {
 				t.Fatalf("Test %d: %s: Failed to fetch the copied object: <ERROR> %s", i+1, instanceType, err)
 			}
+			if _, err = io.Copy(buffer, r); err != nil {
+				r.Close()
+				t.Fatalf("Test %d: %s: Failed to fetch the copied object: <ERROR> %s", i+1, instanceType, err)
+			}
+			r.Close()
 			if !bytes.Equal(testCase.data, buffer.Bytes()) {
 				t.Errorf("Test %d: %s: Data Mismatch: Data fetched back from the uploaded object doesn't match the original one.", i+1, instanceType)
 			}
-			buffer.Reset()
 		}
 	}
 }
@@ -1165,7 +1299,7 @@ func testAPIPutObjectStreamSigV4Handler(obj ObjectLayer, instanceType, bucketNam
 // Wrapper for calling PutObject API handler tests for both Erasure multiple disks and FS single drive setup.
 func TestAPIPutObjectHandler(t *testing.T) {
 	defer DetectTestLeak(t)()
-	ExecObjectLayerAPITest(t, testAPIPutObjectHandler, []string{"PutObject"})
+	ExecExtendedObjectLayerAPITest(t, testAPIPutObjectHandler, []string{"PutObject"})
 }
 
 func testAPIPutObjectHandler(obj ObjectLayer, instanceType, bucketName string, apiRouter http.Handler,
@@ -1321,12 +1455,16 @@ func testAPIPutObjectHandler(obj ObjectLayer, instanceType, bucketName string, a
 		}
 		if testCase.expectedRespStatus == http.StatusOK {
 			buffer := new(bytes.Buffer)
-
 			// Fetch the object to check whether the content is same as the one uploaded via PutObject.
-			err = obj.GetObject(context.Background(), testCase.bucketName, testCase.objectName, 0, int64(len(bytesData)), buffer, "", opts)
+			gr, err := obj.GetObjectNInfo(context.Background(), testCase.bucketName, testCase.objectName, nil, nil, readLock, opts)
 			if err != nil {
 				t.Fatalf("Test %d: %s: Failed to fetch the copied object: <ERROR> %s", i+1, instanceType, err)
 			}
+			if _, err = io.Copy(buffer, gr); err != nil {
+				gr.Close()
+				t.Fatalf("Test %d: %s: Failed to fetch the copied object: <ERROR> %s", i+1, instanceType, err)
+			}
+			gr.Close()
 			if !bytes.Equal(bytesData, buffer.Bytes()) {
 				t.Errorf("Test %d: %s: Data Mismatch: Data fetched back from the uploaded object doesn't match the original one.", i+1, instanceType)
 			}
@@ -1366,10 +1504,15 @@ func testAPIPutObjectHandler(obj ObjectLayer, instanceType, bucketName string, a
 		if testCase.expectedRespStatus == http.StatusOK {
 			buffer := new(bytes.Buffer)
 			// Fetch the object to check whether the content is same as the one uploaded via PutObject.
-			err = obj.GetObject(context.Background(), testCase.bucketName, testCase.objectName, 0, int64(len(bytesData)), buffer, "", opts)
+			gr, err := obj.GetObjectNInfo(context.Background(), testCase.bucketName, testCase.objectName, nil, nil, readLock, opts)
 			if err != nil {
 				t.Fatalf("Test %d: %s: Failed to fetch the copied object: <ERROR> %s", i+1, instanceType, err)
 			}
+			if _, err = io.Copy(buffer, gr); err != nil {
+				gr.Close()
+				t.Fatalf("Test %d: %s: Failed to fetch the copied object: <ERROR> %s", i+1, instanceType, err)
+			}
+			gr.Close()
 			if !bytes.Equal(bytesData, buffer.Bytes()) {
 				t.Errorf("Test %d: %s: Data Mismatch: Data fetched back from the uploaded object doesn't match the original one.", i+1, instanceType)
 			}
@@ -1414,7 +1557,7 @@ func testAPIPutObjectHandler(obj ObjectLayer, instanceType, bucketName string, a
 // expected.
 func TestAPICopyObjectPartHandlerSanity(t *testing.T) {
 	defer DetectTestLeak(t)()
-	ExecObjectLayerAPITest(t, testAPICopyObjectPartHandlerSanity, []string{"CopyObjectPart"})
+	ExecExtendedObjectLayerAPITest(t, testAPICopyObjectPartHandlerSanity, []string{"CopyObjectPart"})
 }
 
 func testAPICopyObjectPartHandlerSanity(obj ObjectLayer, instanceType, bucketName string, apiRouter http.Handler,
@@ -1447,7 +1590,7 @@ func testAPICopyObjectPartHandlerSanity(obj ObjectLayer, instanceType, bucketNam
 	for i, input := range putObjectInputs {
 		// uploading the object.
 		_, err = obj.PutObject(context.Background(), input.bucketName, input.objectName,
-			mustGetPutObjReader(t, bytes.NewBuffer(input.textData), input.contentLength, input.metaData[""], ""), ObjectOptions{UserDefined: input.metaData})
+			mustGetPutObjReader(t, bytes.NewReader(input.textData), input.contentLength, input.metaData[""], ""), ObjectOptions{UserDefined: input.metaData})
 		// if object upload fails stop the test.
 		if err != nil {
 			t.Fatalf("Put Object case %d:  Error uploading object: <ERROR> %v", i+1, err)
@@ -1514,9 +1657,15 @@ func testAPICopyObjectPartHandlerSanity(obj ObjectLayer, instanceType, bucketNam
 	}
 
 	var buf bytes.Buffer
-	if err = obj.GetObject(context.Background(), bucketName, testObject, 0, int64(len(bytesData[0].byteData)), &buf, "", opts); err != nil {
+	r, err := obj.GetObjectNInfo(context.Background(), bucketName, testObject, nil, nil, readLock, ObjectOptions{})
+	if err != nil {
 		t.Fatalf("Test: %s reading completed file failed: <ERROR> %v", instanceType, err)
 	}
+	if _, err = io.Copy(&buf, r); err != nil {
+		r.Close()
+		t.Fatalf("Test %s: Failed to fetch the copied object: <ERROR> %s", instanceType, err)
+	}
+	r.Close()
 	if !bytes.Equal(buf.Bytes(), bytesData[0].byteData) {
 		t.Fatalf("Test: %s returned data is not expected corruption detected:", instanceType)
 	}
@@ -1525,7 +1674,7 @@ func testAPICopyObjectPartHandlerSanity(obj ObjectLayer, instanceType, bucketNam
 // Wrapper for calling Copy Object Part API handler tests for both Erasure multiple disks and single node setup.
 func TestAPICopyObjectPartHandler(t *testing.T) {
 	defer DetectTestLeak(t)()
-	ExecObjectLayerAPITest(t, testAPICopyObjectPartHandler, []string{"CopyObjectPart"})
+	ExecExtendedObjectLayerAPITest(t, testAPICopyObjectPartHandler, []string{"CopyObjectPart"})
 }
 
 func testAPICopyObjectPartHandler(obj ObjectLayer, instanceType, bucketName string, apiRouter http.Handler,
@@ -1557,7 +1706,7 @@ func testAPICopyObjectPartHandler(obj ObjectLayer, instanceType, bucketName stri
 	// iterate through the above set of inputs and upload the object.
 	for i, input := range putObjectInputs {
 		// uploading the object.
-		_, err = obj.PutObject(context.Background(), input.bucketName, input.objectName, mustGetPutObjReader(t, bytes.NewBuffer(input.textData), input.contentLength, input.metaData[""], ""), ObjectOptions{UserDefined: input.metaData})
+		_, err = obj.PutObject(context.Background(), input.bucketName, input.objectName, mustGetPutObjReader(t, bytes.NewReader(input.textData), input.contentLength, input.metaData[""], ""), ObjectOptions{UserDefined: input.metaData})
 		// if object upload fails stop the test.
 		if err != nil {
 			t.Fatalf("Put Object case %d:  Error uploading object: <ERROR> %v", i+1, err)
@@ -1765,7 +1914,7 @@ func testAPICopyObjectPartHandler(obj ObjectLayer, instanceType, bucketName stri
 			copySourceHeader:   url.QueryEscape(SlashSeparator+bucketName+SlashSeparator+objectName) + "?versionId=17",
 			accessKey:          credentials.AccessKey,
 			secretKey:          credentials.SecretKey,
-			expectedRespStatus: http.StatusBadRequest,
+			expectedRespStatus: http.StatusNotFound,
 		},
 	}
 
@@ -1841,7 +1990,7 @@ func testAPICopyObjectPartHandler(obj ObjectLayer, instanceType, bucketName stri
 // Wrapper for calling Copy Object API handler tests for both Erasure multiple disks and single node setup.
 func TestAPICopyObjectHandler(t *testing.T) {
 	defer DetectTestLeak(t)()
-	ExecObjectLayerAPITest(t, testAPICopyObjectHandler, []string{"CopyObject"})
+	ExecExtendedObjectLayerAPITest(t, testAPICopyObjectHandler, []string{"CopyObject"})
 }
 
 func testAPICopyObjectHandler(obj ObjectLayer, instanceType, bucketName string, apiRouter http.Handler,
@@ -1894,7 +2043,7 @@ func testAPICopyObjectHandler(obj ObjectLayer, instanceType, bucketName string, 
 	for i, input := range putObjectInputs {
 		// uploading the object.
 		var objInfo ObjectInfo
-		objInfo, err = obj.PutObject(context.Background(), input.bucketName, input.objectName, mustGetPutObjReader(t, bytes.NewBuffer(input.textData), input.contentLength, input.md5sum, ""), ObjectOptions{UserDefined: input.metaData})
+		objInfo, err = obj.PutObject(context.Background(), input.bucketName, input.objectName, mustGetPutObjReader(t, bytes.NewReader(input.textData), input.contentLength, input.md5sum, ""), ObjectOptions{UserDefined: input.metaData})
 		// if object upload fails stop the test.
 		if err != nil {
 			t.Fatalf("Put Object case %d:  Error uploading object: <ERROR> %v", i+1, err)
@@ -1911,6 +2060,7 @@ func testAPICopyObjectHandler(obj ObjectLayer, instanceType, bucketName string, 
 		copySourceHeader     string // data for "X-Amz-Copy-Source" header. Contains the object to be copied in the URL.
 		copyModifiedHeader   string // data for "X-Amz-Copy-Source-If-Modified-Since" header
 		copyUnmodifiedHeader string // data for "X-Amz-Copy-Source-If-Unmodified-Since" header
+		copySourceSame       bool
 		metadataGarbage      bool
 		metadataReplace      bool
 		metadataCopy         bool
@@ -1920,8 +2070,11 @@ func testAPICopyObjectHandler(obj ObjectLayer, instanceType, bucketName string, 
 		// expected output.
 		expectedRespStatus int
 	}{
+		0: {
+			expectedRespStatus: http.StatusMethodNotAllowed,
+		},
 		// Test case - 1, copy metadata from newObject1, ignore request headers.
-		{
+		1: {
 			bucketName:       bucketName,
 			newObjectName:    "newObject1",
 			copySourceHeader: url.QueryEscape(SlashSeparator + bucketName + SlashSeparator + objectName),
@@ -1935,7 +2088,7 @@ func testAPICopyObjectHandler(obj ObjectLayer, instanceType, bucketName string, 
 
 		// Test case - 2.
 		// Test case with invalid source object.
-		{
+		2: {
 			bucketName:       bucketName,
 			newObjectName:    "newObject1",
 			copySourceHeader: url.QueryEscape(SlashSeparator),
@@ -1947,11 +2100,12 @@ func testAPICopyObjectHandler(obj ObjectLayer, instanceType, bucketName string, 
 
 		// Test case - 3.
 		// Test case with new object name is same as object to be copied.
-		{
+		3: {
 			bucketName:       bucketName,
 			newObjectName:    objectName,
 			copySourceHeader: url.QueryEscape(SlashSeparator + bucketName + SlashSeparator + objectName),
 			accessKey:        credentials.AccessKey,
+			copySourceSame:   true,
 			secretKey:        credentials.SecretKey,
 
 			expectedRespStatus: http.StatusBadRequest,
@@ -1960,9 +2114,10 @@ func testAPICopyObjectHandler(obj ObjectLayer, instanceType, bucketName string, 
 		// Test case - 4.
 		// Test case with new object name is same as object to be copied.
 		// But source copy is without leading slash
-		{
+		4: {
 			bucketName:       bucketName,
 			newObjectName:    objectName,
+			copySourceSame:   true,
 			copySourceHeader: url.QueryEscape(bucketName + SlashSeparator + objectName),
 			accessKey:        credentials.AccessKey,
 			secretKey:        credentials.SecretKey,
@@ -1973,7 +2128,7 @@ func testAPICopyObjectHandler(obj ObjectLayer, instanceType, bucketName string, 
 		// Test case - 5.
 		// Test case with new object name is same as object to be copied
 		// but metadata is updated.
-		{
+		5: {
 			bucketName:       bucketName,
 			newObjectName:    objectName,
 			copySourceHeader: url.QueryEscape(SlashSeparator + bucketName + SlashSeparator + objectName),
@@ -1989,7 +2144,7 @@ func testAPICopyObjectHandler(obj ObjectLayer, instanceType, bucketName string, 
 
 		// Test case - 6.
 		// Test case with invalid metadata-directive.
-		{
+		6: {
 			bucketName:       bucketName,
 			newObjectName:    "newObject1",
 			copySourceHeader: url.QueryEscape(SlashSeparator + bucketName + SlashSeparator + objectName),
@@ -2006,16 +2161,17 @@ func testAPICopyObjectHandler(obj ObjectLayer, instanceType, bucketName string, 
 		// Test case - 7.
 		// Test case with new object name is same as object to be copied
 		// fail with BadRequest.
-		{
+		7: {
 			bucketName:       bucketName,
 			newObjectName:    objectName,
 			copySourceHeader: url.QueryEscape(SlashSeparator + bucketName + SlashSeparator + objectName),
 			metadata: map[string]string{
 				"Content-Type": "application/json",
 			},
-			metadataCopy: true,
-			accessKey:    credentials.AccessKey,
-			secretKey:    credentials.SecretKey,
+			copySourceSame: true,
+			metadataCopy:   true,
+			accessKey:      credentials.AccessKey,
+			secretKey:      credentials.SecretKey,
 
 			expectedRespStatus: http.StatusBadRequest,
 		},
@@ -2024,7 +2180,7 @@ func testAPICopyObjectHandler(obj ObjectLayer, instanceType, bucketName string, 
 		// Test case with non-existent source file.
 		// Case for the purpose of failing `api.ObjectAPI.GetObjectInfo`.
 		// Expecting the response status code to http.StatusNotFound (404).
-		{
+		8: {
 			bucketName:       bucketName,
 			newObjectName:    objectName,
 			copySourceHeader: url.QueryEscape(SlashSeparator + bucketName + SlashSeparator + "non-existent-object"),
@@ -2038,7 +2194,7 @@ func testAPICopyObjectHandler(obj ObjectLayer, instanceType, bucketName string, 
 		// Test case with non-existent source file.
 		// Case for the purpose of failing `api.ObjectAPI.PutObject`.
 		// Expecting the response status code to http.StatusNotFound (404).
-		{
+		9: {
 			bucketName:       "non-existent-destination-bucket",
 			newObjectName:    objectName,
 			copySourceHeader: url.QueryEscape(SlashSeparator + bucketName + SlashSeparator + objectName),
@@ -2050,7 +2206,7 @@ func testAPICopyObjectHandler(obj ObjectLayer, instanceType, bucketName string, 
 
 		// Test case - 10.
 		// Case with invalid AccessKey.
-		{
+		10: {
 			bucketName:       bucketName,
 			newObjectName:    objectName,
 			copySourceHeader: url.QueryEscape(SlashSeparator + bucketName + SlashSeparator + objectName),
@@ -2060,7 +2216,7 @@ func testAPICopyObjectHandler(obj ObjectLayer, instanceType, bucketName string, 
 			expectedRespStatus: http.StatusForbidden,
 		},
 		// Test case - 11, copy metadata from newObject1 with satisfying modified header.
-		{
+		11: {
 			bucketName:         bucketName,
 			newObjectName:      "newObject1",
 			copySourceHeader:   url.QueryEscape(SlashSeparator + bucketName + SlashSeparator + objectName),
@@ -2070,7 +2226,7 @@ func testAPICopyObjectHandler(obj ObjectLayer, instanceType, bucketName string, 
 			expectedRespStatus: http.StatusOK,
 		},
 		// Test case - 12, copy metadata from newObject1 with unsatisfying modified header.
-		{
+		12: {
 			bucketName:         bucketName,
 			newObjectName:      "newObject1",
 			copySourceHeader:   url.QueryEscape(SlashSeparator + bucketName + SlashSeparator + objectName),
@@ -2080,7 +2236,7 @@ func testAPICopyObjectHandler(obj ObjectLayer, instanceType, bucketName string, 
 			expectedRespStatus: http.StatusPreconditionFailed,
 		},
 		// Test case - 13, copy metadata from newObject1 with wrong modified header format
-		{
+		13: {
 			bucketName:         bucketName,
 			newObjectName:      "newObject1",
 			copySourceHeader:   url.QueryEscape(SlashSeparator + bucketName + SlashSeparator + objectName),
@@ -2090,7 +2246,7 @@ func testAPICopyObjectHandler(obj ObjectLayer, instanceType, bucketName string, 
 			expectedRespStatus: http.StatusOK,
 		},
 		// Test case - 14, copy metadata from newObject1 with satisfying unmodified header.
-		{
+		14: {
 			bucketName:           bucketName,
 			newObjectName:        "newObject1",
 			copySourceHeader:     url.QueryEscape(SlashSeparator + bucketName + SlashSeparator + objectName),
@@ -2100,7 +2256,7 @@ func testAPICopyObjectHandler(obj ObjectLayer, instanceType, bucketName string, 
 			expectedRespStatus:   http.StatusOK,
 		},
 		// Test case - 15, copy metadata from newObject1 with unsatisfying unmodified header.
-		{
+		15: {
 			bucketName:           bucketName,
 			newObjectName:        "newObject1",
 			copySourceHeader:     url.QueryEscape(SlashSeparator + bucketName + SlashSeparator + objectName),
@@ -2110,7 +2266,7 @@ func testAPICopyObjectHandler(obj ObjectLayer, instanceType, bucketName string, 
 			expectedRespStatus:   http.StatusPreconditionFailed,
 		},
 		// Test case - 16, copy metadata from newObject1 with incorrect unmodified header format.
-		{
+		16: {
 			bucketName:           bucketName,
 			newObjectName:        "newObject1",
 			copySourceHeader:     url.QueryEscape(SlashSeparator + bucketName + SlashSeparator + objectName),
@@ -2120,7 +2276,7 @@ func testAPICopyObjectHandler(obj ObjectLayer, instanceType, bucketName string, 
 			expectedRespStatus:   http.StatusOK,
 		},
 		// Test case - 17, copy metadata from newObject1 with null versionId
-		{
+		17: {
 			bucketName:         bucketName,
 			newObjectName:      "newObject1",
 			copySourceHeader:   url.QueryEscape(SlashSeparator+bucketName+SlashSeparator+objectName) + "?versionId=null",
@@ -2129,13 +2285,13 @@ func testAPICopyObjectHandler(obj ObjectLayer, instanceType, bucketName string, 
 			expectedRespStatus: http.StatusOK,
 		},
 		// Test case - 18, copy metadata from newObject1 with non null versionId
-		{
+		18: {
 			bucketName:         bucketName,
 			newObjectName:      "newObject1",
 			copySourceHeader:   url.QueryEscape(SlashSeparator+bucketName+SlashSeparator+objectName) + "?versionId=17",
 			accessKey:          credentials.AccessKey,
 			secretKey:          credentials.SecretKey,
-			expectedRespStatus: http.StatusBadRequest,
+			expectedRespStatus: http.StatusNotFound,
 		},
 	}
 
@@ -2149,7 +2305,7 @@ func testAPICopyObjectHandler(obj ObjectLayer, instanceType, bucketName string, 
 			0, nil, testCase.accessKey, testCase.secretKey, nil)
 
 		if err != nil {
-			t.Fatalf("Test %d: Failed to create HTTP request for copy Object: <ERROR> %v", i+1, err)
+			t.Fatalf("Test %d: Failed to create HTTP request for copy Object: <ERROR> %v", i, err)
 		}
 		// "X-Amz-Copy-Source" header contains the information about the source bucket and the object to copied.
 		if testCase.copySourceHeader != "" {
@@ -2179,24 +2335,40 @@ func testAPICopyObjectHandler(obj ObjectLayer, instanceType, bucketName string, 
 		apiRouter.ServeHTTP(rec, req)
 		// Assert the response code with the expected status.
 		if rec.Code != testCase.expectedRespStatus {
-			t.Fatalf("Test %d: %s:  Expected the response status to be `%d`, but instead found `%d`", i+1, instanceType, testCase.expectedRespStatus, rec.Code)
+			if testCase.copySourceSame {
+				// encryption will rotate creds, so fail only for non-encryption scenario.
+				if GlobalKMS == nil {
+					t.Errorf("Test %d: %s:  Expected the response status to be `%d`, but instead found `%d`", i, instanceType, testCase.expectedRespStatus, rec.Code)
+					continue
+				}
+			} else {
+				t.Errorf("Test %d: %s:  Expected the response status to be `%d`, but instead found `%d`", i, instanceType, testCase.expectedRespStatus, rec.Code)
+				continue
+			}
 		}
 		if rec.Code == http.StatusOK {
 			var cpObjResp CopyObjectResponse
 			if err = xml.Unmarshal(rec.Body.Bytes(), &cpObjResp); err != nil {
-				t.Fatalf("Test %d: %s: Failed to parse the CopyObjectResult response: <ERROR> %s", i+1, instanceType, err)
+				t.Fatalf("Test %d: %s: Failed to parse the CopyObjectResult response: <ERROR> %s", i, instanceType, err)
 			}
 
 			// See if the new object is formed.
 			// testing whether the copy was successful.
-			err = obj.GetObject(context.Background(), testCase.bucketName, testCase.newObjectName, 0, int64(len(bytesData[0].byteData)), buffers[0], "", opts)
-			if err != nil {
-				t.Fatalf("Test %d: %s: Failed to fetch the copied object: <ERROR> %s", i+1, instanceType, err)
-			}
-			if !bytes.Equal(bytesData[0].byteData, buffers[0].Bytes()) {
-				t.Errorf("Test %d: %s: Data Mismatch: Data fetched back from the copied object doesn't match the original one.", i+1, instanceType)
-			}
+			// Note that this goes directly to the file system,
+			// so encryption/compression may interfere at some point.
 			buffers[0].Reset()
+			r, err := obj.GetObjectNInfo(context.Background(), testCase.bucketName, testCase.newObjectName, nil, nil, readLock, opts)
+			if err != nil {
+				t.Fatalf("Test %d: %s reading completed file failed: <ERROR> %v", i, instanceType, err)
+			}
+			if _, err = io.Copy(buffers[0], r); err != nil {
+				r.Close()
+				t.Fatalf("Test %d %s: Failed to fetch the copied object: <ERROR> %s", i, instanceType, err)
+			}
+			r.Close()
+			if !bytes.Equal(bytesData[0].byteData, buffers[0].Bytes()) {
+				t.Errorf("Test %d: %s: Data Mismatch: Data fetched back from the copied object doesn't match the original one.", i, instanceType)
+			}
 		}
 
 		// Verify response of the V2 signed HTTP request.
@@ -2205,7 +2377,7 @@ func testAPICopyObjectHandler(obj ObjectLayer, instanceType, bucketName string, 
 
 		reqV2, err = newTestRequest(http.MethodPut, getCopyObjectURL("", testCase.bucketName, testCase.newObjectName), 0, nil)
 		if err != nil {
-			t.Fatalf("Test %d: Failed to create HTTP request for copy Object: <ERROR> %v", i+1, err)
+			t.Fatalf("Test %d: Failed to create HTTP request for copy Object: <ERROR> %v", i, err)
 		}
 		// "X-Amz-Copy-Source" header contains the information about the source bucket and the object to copied.
 		if testCase.copySourceHeader != "" {
@@ -2241,7 +2413,14 @@ func testAPICopyObjectHandler(obj ObjectLayer, instanceType, bucketName string, 
 		// Call the ServeHTTP to execute the handler.
 		apiRouter.ServeHTTP(recV2, reqV2)
 		if recV2.Code != testCase.expectedRespStatus {
-			t.Errorf("Test %d: %s: Expected the response status to be `%d`, but instead found `%d`", i+1, instanceType, testCase.expectedRespStatus, recV2.Code)
+			if testCase.copySourceSame {
+				// encryption will rotate creds, so fail only for non-encryption scenario.
+				if GlobalKMS == nil {
+					t.Errorf("Test %d: %s:  Expected the response status to be `%d`, but instead found `%d`", i, instanceType, testCase.expectedRespStatus, rec.Code)
+				}
+			} else {
+				t.Errorf("Test %d: %s:  Expected the response status to be `%d`, but instead found `%d`", i+1, instanceType, testCase.expectedRespStatus, rec.Code)
+			}
 		}
 	}
 
@@ -2544,7 +2723,7 @@ func testAPICompleteMultipartHandler(obj ObjectLayer, instanceType, bucketName s
 	// Iterating over creatPartCases to generate multipart chunks.
 	for _, part := range parts {
 		_, err = obj.PutObjectPart(context.Background(), part.bucketName, part.objName, part.uploadID, part.PartID,
-			mustGetPutObjReader(t, bytes.NewBufferString(part.inputReaderData), part.intputDataSize, part.inputMd5, ""), opts)
+			mustGetPutObjReader(t, strings.NewReader(part.inputReaderData), part.intputDataSize, part.inputMd5, ""), opts)
 		if err != nil {
 			t.Fatalf("%s : %s", instanceType, err)
 		}
@@ -2788,7 +2967,8 @@ func testAPICompleteMultipartHandler(obj ObjectLayer, instanceType, bucketName s
 		if rec.Code == http.StatusOK {
 			// Verify whether the bucket obtained object is same as the one created.
 			if !bytes.Equal(testCase.expectedContent, actualContent) {
-				t.Errorf("Test %d : MinIO %s: Object content differs from expected value.", i+1, instanceType)
+				t.Errorf("Test %d : MinIO %s: CompleteMultipart response content differs from expected value. got %s, expecte %s", i+1, instanceType,
+					string(actualContent), string(testCase.expectedContent))
 			}
 			continue
 		}
@@ -2803,7 +2983,7 @@ func testAPICompleteMultipartHandler(obj ObjectLayer, instanceType, bucketName s
 		}
 
 		if actualError.Key != objectName {
-			t.Errorf("MinIO %s: error response object name differs from expected value", instanceType)
+			t.Errorf("MinIO %s: error response object name (%s) differs from expected value (%s)", instanceType, actualError.Key, objectName)
 		}
 	}
 
@@ -2914,7 +3094,7 @@ func testAPIAbortMultipartHandler(obj ObjectLayer, instanceType, bucketName stri
 	// Iterating over createPartCases to generate multipart chunks.
 	for _, part := range parts {
 		_, err = obj.PutObjectPart(context.Background(), part.bucketName, part.objName, part.uploadID, part.PartID,
-			mustGetPutObjReader(t, bytes.NewBufferString(part.inputReaderData), part.intputDataSize, part.inputMd5, ""), opts)
+			mustGetPutObjReader(t, strings.NewReader(part.inputReaderData), part.intputDataSize, part.inputMd5, ""), opts)
 		if err != nil {
 			t.Fatalf("%s : %s", instanceType, err)
 		}
@@ -3051,7 +3231,7 @@ func testAPIDeleteObjectHandler(obj ObjectLayer, instanceType, bucketName string
 	// iterate through the above set of inputs and upload the object.
 	for i, input := range putObjectInputs {
 		// uploading the object.
-		_, err = obj.PutObject(context.Background(), input.bucketName, input.objectName, mustGetPutObjReader(t, bytes.NewBuffer(input.textData), input.contentLength, input.metaData[""], ""), ObjectOptions{UserDefined: input.metaData})
+		_, err = obj.PutObject(context.Background(), input.bucketName, input.objectName, mustGetPutObjReader(t, bytes.NewReader(input.textData), input.contentLength, input.metaData[""], ""), ObjectOptions{UserDefined: input.metaData})
 		// if object upload fails stop the test.
 		if err != nil {
 			t.Fatalf("Put Object case %d:  Error uploading object: <ERROR> %v", i+1, err)
@@ -3178,7 +3358,7 @@ func testAPIDeleteObjectHandler(obj ObjectLayer, instanceType, bucketName string
 // when the request signature type is `streaming signature`.
 func TestAPIPutObjectPartHandlerStreaming(t *testing.T) {
 	defer DetectTestLeak(t)()
-	ExecObjectLayerAPITest(t, testAPIPutObjectPartHandlerStreaming, []string{"NewMultipart", "PutObjectPart"})
+	ExecExtendedObjectLayerAPITest(t, testAPIPutObjectPartHandlerStreaming, []string{"NewMultipart", "PutObjectPart"})
 }
 
 func testAPIPutObjectPartHandlerStreaming(obj ObjectLayer, instanceType, bucketName string, apiRouter http.Handler,
@@ -3266,7 +3446,7 @@ func testAPIPutObjectPartHandlerStreaming(obj ObjectLayer, instanceType, bucketN
 //  for variety of inputs.
 func TestAPIPutObjectPartHandler(t *testing.T) {
 	defer DetectTestLeak(t)()
-	ExecObjectLayerAPITest(t, testAPIPutObjectPartHandler, []string{"PutObjectPart"})
+	ExecExtendedObjectLayerAPITest(t, testAPIPutObjectPartHandler, []string{"PutObjectPart"})
 }
 
 func testAPIPutObjectPartHandler(obj ObjectLayer, instanceType, bucketName string, apiRouter http.Handler,
@@ -3671,7 +3851,7 @@ func testAPIListObjectPartsHandlerPreSign(obj ObjectLayer, instanceType, bucketN
 //  for variety of success/failure cases.
 func TestAPIListObjectPartsHandler(t *testing.T) {
 	defer DetectTestLeak(t)()
-	ExecObjectLayerAPITest(t, testAPIListObjectPartsHandler, []string{"ListObjectParts"})
+	ExecExtendedObjectLayerAPITest(t, testAPIListObjectPartsHandler, []string{"ListObjectParts"})
 }
 
 func testAPIListObjectPartsHandler(obj ObjectLayer, instanceType, bucketName string, apiRouter http.Handler,

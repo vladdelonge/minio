@@ -26,6 +26,7 @@ package cmd
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
 	"net/http"
@@ -36,8 +37,9 @@ import (
 	"time"
 
 	"github.com/minio/minio-go/v7/pkg/s3utils"
+	"github.com/minio/minio-go/v7/pkg/set"
 	xhttp "github.com/minio/minio/cmd/http"
-	sha256 "github.com/minio/sha256-simd"
+	"github.com/minio/minio/pkg/auth"
 )
 
 // AWS Signature Version '4' constants.
@@ -148,7 +150,7 @@ func getSignature(signingKey []byte, stringToSign string) string {
 }
 
 // Check to see if Policy is signed correctly.
-func doesPolicySignatureMatch(formValues http.Header) APIErrorCode {
+func doesPolicySignatureMatch(formValues http.Header) (auth.Credentials, APIErrorCode) {
 	// For SignV2 - Signature field will be valid
 	if _, ok := formValues["Signature"]; ok {
 		return doesPolicySignatureV2Match(formValues)
@@ -168,19 +170,19 @@ func compareSignatureV4(sig1, sig2 string) bool {
 // doesPolicySignatureMatch - Verify query headers with post policy
 //     - http://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-HTTPPOSTConstructPolicy.html
 // returns ErrNone if the signature matches.
-func doesPolicySignatureV4Match(formValues http.Header) APIErrorCode {
+func doesPolicySignatureV4Match(formValues http.Header) (auth.Credentials, APIErrorCode) {
 	// Server region.
 	region := globalServerRegion
 
 	// Parse credential tag.
 	credHeader, s3Err := parseCredentialHeader("Credential="+formValues.Get(xhttp.AmzCredential), region, serviceS3)
 	if s3Err != ErrNone {
-		return s3Err
+		return auth.Credentials{}, s3Err
 	}
 
 	cred, _, s3Err := checkKeyValid(credHeader.accessKey)
 	if s3Err != ErrNone {
-		return s3Err
+		return cred, s3Err
 	}
 
 	// Get signing key.
@@ -191,11 +193,11 @@ func doesPolicySignatureV4Match(formValues http.Header) APIErrorCode {
 
 	// Verify signature.
 	if !compareSignatureV4(newSignature, formValues.Get(xhttp.AmzSignature)) {
-		return ErrSignatureDoesNotMatch
+		return cred, ErrSignatureDoesNotMatch
 	}
 
 	// Success.
-	return ErrNone
+	return cred, ErrNone
 }
 
 // doesPresignedSignatureMatch - Verify query headers with presigned signature
@@ -256,25 +258,22 @@ func doesPresignedSignatureMatch(hashedPayload string, r *http.Request, region s
 	query.Set(xhttp.AmzSignedHeaders, getSignedHeaders(extractedSignedHeaders))
 	query.Set(xhttp.AmzCredential, cred.AccessKey+SlashSeparator+pSignValues.Credential.getScope())
 
-	// Save other headers available in the request parameters.
+	defaultSigParams := set.CreateStringSet(
+		xhttp.AmzContentSha256,
+		xhttp.AmzSecurityToken,
+		xhttp.AmzAlgorithm,
+		xhttp.AmzDate,
+		xhttp.AmzExpires,
+		xhttp.AmzSignedHeaders,
+		xhttp.AmzCredential,
+		xhttp.AmzSignature,
+	)
+
+	// Add missing query parameters if any provided in the request URL
 	for k, v := range req.URL.Query() {
-		key := strings.ToLower(k)
-
-		// Handle the metadata in presigned put query string
-		if strings.Contains(key, "x-amz-meta-") {
-			query.Set(k, v[0])
-			continue
+		if !defaultSigParams.Contains(k) {
+			query[k] = v
 		}
-
-		if strings.Contains(key, "x-amz-server-side-") {
-			query.Set(k, v[0])
-			continue
-		}
-
-		if strings.HasPrefix(key, "x-amz") {
-			continue
-		}
-		query[k] = v
 	}
 
 	// Get the encoded query.

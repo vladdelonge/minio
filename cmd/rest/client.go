@@ -19,14 +19,17 @@ package rest
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"io/ioutil"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"sync/atomic"
 	"time"
 
 	xhttp "github.com/minio/minio/cmd/http"
+	"github.com/minio/minio/cmd/logger"
 	xnet "github.com/minio/minio/pkg/net"
 )
 
@@ -38,6 +41,19 @@ const (
 	online
 	closed
 )
+
+// Hold the number of failed RPC calls due to networking errors
+var networkErrsCounter uint64
+
+// GetNetworkErrsCounter returns the number of failed RPC requests
+func GetNetworkErrsCounter() uint64 {
+	return atomic.LoadUint64(&networkErrsCounter)
+}
+
+// ResetNetworkErrsCounter resets the number of failed RPC requests
+func ResetNetworkErrsCounter() {
+	atomic.StoreUint64(&networkErrsCounter, 0)
+}
 
 // NetworkError - error type in case of errors related to http/transport
 // for ex. connection refused, connection reset, dns resolution failure etc.
@@ -57,6 +73,8 @@ func (n *NetworkError) Unwrap() error {
 
 // Client - http based RPC client.
 type Client struct {
+	connected int32 // ref: https://golang.org/pkg/sync/atomic/#pkg-note-BUG
+
 	// HealthCheckFn is the function set to test for health.
 	// If not set the client will not keep track of health.
 	// Calling this returns true or false if the target
@@ -74,11 +92,13 @@ type Client struct {
 	// Should only be modified before any calls are made.
 	MaxErrResponseSize int64
 
-	httpClient          *http.Client
-	httpIdleConnsCloser func()
-	url                 *url.URL
-	newAuthToken        func(audience string) string
-	connected           int32
+	// ExpectTimeouts indicates if context timeouts are expected.
+	// This will not mark the client offline in these cases.
+	ExpectTimeouts bool
+
+	httpClient   *http.Client
+	url          *url.URL
+	newAuthToken func(audience string) string
 }
 
 // URL query separator constants
@@ -105,15 +125,18 @@ func (c *Client) Call(ctx context.Context, method string, values url.Values, bod
 	if err != nil {
 		return nil, &NetworkError{err}
 	}
-	req.Header.Set("Authorization", "Bearer "+c.newAuthToken(req.URL.Query().Encode()))
+	req.Header.Set("Authorization", "Bearer "+c.newAuthToken(req.URL.RawQuery))
 	req.Header.Set("X-Minio-Time", time.Now().UTC().Format(time.RFC3339))
 	if length > 0 {
 		req.ContentLength = length
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		if xnet.IsNetworkOrHostDown(err) {
-			c.MarkOffline()
+		if c.HealthCheckFn != nil && xnet.IsNetworkOrHostDown(err, c.ExpectTimeouts) {
+			atomic.AddUint64(&networkErrsCounter, 1)
+			if c.MarkOffline() {
+				logger.LogIf(ctx, fmt.Errorf("Marking %s temporary offline; caused by %w", c.url.String(), err))
+			}
 		}
 		return nil, &NetworkError{err}
 	}
@@ -134,15 +157,18 @@ func (c *Client) Call(ctx context.Context, method string, values url.Values, bod
 		// with the caller to take the client offline purpose
 		// fully it should make sure to respond with '412'
 		// instead, see cmd/storage-rest-server.go for ideas.
-		if resp.StatusCode == http.StatusPreconditionFailed {
+		if c.HealthCheckFn != nil && resp.StatusCode == http.StatusPreconditionFailed {
+			logger.LogIf(ctx, fmt.Errorf("Marking %s temporary offline; caused by PreconditionFailed with disk ID mismatch", c.url.String()))
 			c.MarkOffline()
 		}
 		defer xhttp.DrainBody(resp.Body)
 		// Limit the ReadAll(), just in case, because of a bug, the server responds with large data.
 		b, err := ioutil.ReadAll(io.LimitReader(resp.Body, c.MaxErrResponseSize))
 		if err != nil {
-			if xnet.IsNetworkOrHostDown(err) {
-				c.MarkOffline()
+			if c.HealthCheckFn != nil && xnet.IsNetworkOrHostDown(err, c.ExpectTimeouts) {
+				if c.MarkOffline() {
+					logger.LogIf(ctx, fmt.Errorf("Marking %s temporary offline; caused by %w", c.url.String(), err))
+				}
 			}
 			return nil, err
 		}
@@ -157,19 +183,14 @@ func (c *Client) Call(ctx context.Context, method string, values url.Values, bod
 // Close closes all idle connections of the underlying http client
 func (c *Client) Close() {
 	atomic.StoreInt32(&c.connected, closed)
-	if c.httpIdleConnsCloser != nil {
-		c.httpIdleConnsCloser()
-	}
 }
 
 // NewClient - returns new REST client.
-func NewClient(url *url.URL, newCustomTransport func() *http.Transport, newAuthToken func(aud string) string) *Client {
+func NewClient(url *url.URL, tr http.RoundTripper, newAuthToken func(aud string) string) *Client {
 	// Transport is exactly same as Go default in https://golang.org/pkg/net/http/#RoundTripper
 	// except custom DialContext and TLSClientConfig.
-	tr := newCustomTransport()
 	return &Client{
 		httpClient:          &http.Client{Transport: tr},
-		httpIdleConnsCloser: tr.CloseIdleConnections,
 		url:                 url,
 		newAuthToken:        newAuthToken,
 		connected:           online,
@@ -186,22 +207,27 @@ func (c *Client) IsOnline() bool {
 
 // MarkOffline - will mark a client as being offline and spawns
 // a goroutine that will attempt to reconnect if HealthCheckFn is set.
-func (c *Client) MarkOffline() {
+// returns true if the node changed state from online to offline
+func (c *Client) MarkOffline() bool {
 	// Start goroutine that will attempt to reconnect.
 	// If server is already trying to reconnect this will have no effect.
 	if c.HealthCheckFn != nil && atomic.CompareAndSwapInt32(&c.connected, online, offline) {
-		go func(healthFunc func() bool) {
-			ticker := time.NewTicker(c.HealthCheckInterval)
-			defer ticker.Stop()
-			for range ticker.C {
+		r := rand.New(rand.NewSource(time.Now().UnixNano()))
+		go func() {
+			for {
 				if atomic.LoadInt32(&c.connected) == closed {
 					return
 				}
-				if healthFunc() {
-					atomic.CompareAndSwapInt32(&c.connected, offline, online)
+				if c.HealthCheckFn() {
+					if atomic.CompareAndSwapInt32(&c.connected, offline, online) {
+						logger.Info("Client %s online", c.url.String())
+					}
 					return
 				}
+				time.Sleep(time.Duration(r.Float64() * float64(c.HealthCheckInterval)))
 			}
-		}(c.HealthCheckFn)
+		}()
+		return true
 	}
+	return false
 }

@@ -18,18 +18,27 @@ package cmd
 
 import (
 	"context"
-	"path"
 	"sync"
 
 	"github.com/minio/minio/pkg/sync/errgroup"
 )
+
+func (er erasureObjects) getLocalDisks() (localDisks []StorageAPI) {
+	disks := er.getDisks()
+	for _, disk := range disks {
+		if disk != nil && disk.IsLocal() {
+			localDisks = append(localDisks, disk)
+		}
+	}
+	return localDisks
+}
 
 func (er erasureObjects) getLoadBalancedLocalDisks() (newDisks []StorageAPI) {
 	disks := er.getDisks()
 	// Based on the random shuffling return back randomized disks.
 	for _, i := range hashOrder(UTCNow().String(), len(disks)) {
 		if disks[i-1] != nil && disks[i-1].IsLocal() {
-			if !disks[i-1].Healing() && disks[i-1].IsOnline() {
+			if disks[i-1].Healing() == nil && disks[i-1].IsOnline() {
 				newDisks = append(newDisks, disks[i-1])
 			}
 		}
@@ -37,12 +46,48 @@ func (er erasureObjects) getLoadBalancedLocalDisks() (newDisks []StorageAPI) {
 	return newDisks
 }
 
+func (er erasureObjects) getOnlineDisks() (newDisks []StorageAPI) {
+	disks := er.getDisks()
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	for _, i := range hashOrder(UTCNow().String(), len(disks)) {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if disks[i-1] == nil {
+				return
+			}
+			di, err := disks[i-1].DiskInfo(context.Background())
+			if err != nil || di.Healing {
+
+				// - Do not consume disks which are not reachable
+				//   unformatted or simply not accessible for some reason.
+				//
+				// - Do not consume disks which are being healed
+				//
+				// - Future: skip busy disks
+				return
+			}
+
+			mu.Lock()
+			newDisks = append(newDisks, disks[i-1])
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	return newDisks
+}
+
 // getLoadBalancedNDisks - fetches load balanced (sufficiently randomized) disk slice
 // with N disks online. If ndisks is zero or negative, then it will returns all disks,
 // same if ndisks is greater than the number of all disks.
 func (er erasureObjects) getLoadBalancedNDisks(ndisks int) (newDisks []StorageAPI) {
-	disks := er.getLoadBalancedDisks()
+	disks := er.getLoadBalancedDisks(ndisks != -1)
 	for _, disk := range disks {
+		if disk == nil {
+			continue
+		}
 		newDisks = append(newDisks, disk)
 		ndisks--
 		if ndisks == 0 {
@@ -54,8 +99,16 @@ func (er erasureObjects) getLoadBalancedNDisks(ndisks int) (newDisks []StorageAP
 
 // getLoadBalancedDisks - fetches load balanced (sufficiently randomized) disk slice.
 // ensures to skip disks if they are not healing and online.
-func (er erasureObjects) getLoadBalancedDisks() []StorageAPI {
+func (er erasureObjects) getLoadBalancedDisks(optimized bool) []StorageAPI {
 	disks := er.getDisks()
+
+	if !optimized {
+		var newDisks []StorageAPI
+		for _, i := range hashOrder(UTCNow().String(), len(disks)) {
+			newDisks = append(newDisks, disks[i-1])
+		}
+		return newDisks
+	}
 
 	var wg sync.WaitGroup
 	var mu sync.Mutex
@@ -81,8 +134,8 @@ func (er erasureObjects) getLoadBalancedDisks() []StorageAPI {
 			}
 
 			mu.Lock()
-			// Capture disks usage wise
-			newDisks[di.Used] = append(newDisks[di.Used], disks[i-1])
+			// Capture disks usage wise upto resolution of MiB
+			newDisks[di.Used/1024/1024] = append(newDisks[di.Used/1024/1024], disks[i-1])
 			mu.Unlock()
 		}()
 	}
@@ -100,27 +153,12 @@ func (er erasureObjects) getLoadBalancedDisks() []StorageAPI {
 }
 
 // This function does the following check, suppose
-// object is "a/b/c/d", stat makes sure that objects ""a/b/c""
-// "a/b" and "a" do not exist.
+// object is "a/b/c/d", stat makes sure that objects
+// - "a/b/c"
+// - "a/b"
+// - "a"
+// do not exist on the namespace.
 func (er erasureObjects) parentDirIsObject(ctx context.Context, bucket, parent string) bool {
-	var isParentDirObject func(string) bool
-	isParentDirObject = func(p string) bool {
-		if p == "." || p == SlashSeparator {
-			return false
-		}
-		if er.isObject(ctx, bucket, p) {
-			// If there is already a file at prefix "p", return true.
-			return true
-		}
-		// Check if there is a file as one of the parent paths.
-		return isParentDirObject(path.Dir(p))
-	}
-	return isParentDirObject(parent)
-}
-
-// isObject - returns `true` if the prefix is an object i.e if
-// `xl.meta` exists at the leaf, false otherwise.
-func (er erasureObjects) isObject(ctx context.Context, bucket, prefix string) (ok bool) {
 	storageDisks := er.getDisks()
 
 	g := errgroup.WithNErrs(len(storageDisks))
@@ -132,7 +170,7 @@ func (er erasureObjects) isObject(ctx context.Context, bucket, prefix string) (o
 				return errDiskNotFound
 			}
 			// Check if 'prefix' is an object on this 'disk', else continue the check the next disk
-			return storageDisks[index].CheckFile(ctx, bucket, prefix)
+			return storageDisks[index].CheckFile(ctx, bucket, parent)
 		}, index)
 	}
 

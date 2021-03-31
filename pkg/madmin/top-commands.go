@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -38,7 +39,8 @@ type LockEntry struct {
 	ServerList []string  `json:"serverlist"` // List of servers participating in the lock.
 	Owner      string    `json:"owner"`      // Owner UUID indicates server owns the lock.
 	ID         string    `json:"id"`         // UID to uniquely identify request of client.
-	Quorum     int       `json:"quorum"`     // represents quorum number of servers required to hold this lock, used to look for stale locks.
+	// Represents quorum number of servers required to hold this lock, used to look for stale locks.
+	Quorum int `json:"quorum"`
 }
 
 // LockEntries - To sort the locks
@@ -60,6 +62,30 @@ func (l LockEntries) Swap(i, j int) {
 type TopLockOpts struct {
 	Count int
 	Stale bool
+}
+
+// ForceUnlock force unlocks input paths...
+func (adm *AdminClient) ForceUnlock(ctx context.Context, paths ...string) error {
+	// Execute POST on /minio/admin/v3/force-unlock
+	queryVals := make(url.Values)
+	queryVals.Set("paths", strings.Join(paths, ","))
+	resp, err := adm.executeMethod(ctx,
+		http.MethodPost,
+		requestData{
+			relPath:     adminAPIPrefix + "/force-unlock",
+			queryValues: queryVals,
+		},
+	)
+	defer closeResponse(resp)
+	if err != nil {
+		return err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return httpRespToErrorResponse(resp)
+	}
+
+	return nil
 }
 
 // TopLocksWithOpts - returns the count number of oldest locks currently active on the server.

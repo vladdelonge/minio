@@ -17,13 +17,14 @@
 package cmd
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"errors"
 	"hash"
 	"io"
 
 	"github.com/minio/highwayhash"
 	"github.com/minio/minio/cmd/logger"
-	sha256 "github.com/minio/sha256-simd"
 	"golang.org/x/crypto/blake2b"
 )
 
@@ -96,16 +97,16 @@ func BitrotAlgorithmFromString(s string) (a BitrotAlgorithm) {
 	return
 }
 
-func newBitrotWriter(disk StorageAPI, volume, filePath string, length int64, algo BitrotAlgorithm, shardSize int64) io.Writer {
+func newBitrotWriter(disk StorageAPI, volume, filePath string, length int64, algo BitrotAlgorithm, shardSize int64, heal bool) io.Writer {
 	if algo == HighwayHash256S {
-		return newStreamingBitrotWriter(disk, volume, filePath, length, algo, shardSize)
+		return newStreamingBitrotWriter(disk, volume, filePath, length, algo, shardSize, heal)
 	}
 	return newWholeBitrotWriter(disk, volume, filePath, algo, shardSize)
 }
 
-func newBitrotReader(disk StorageAPI, bucket string, filePath string, tillOffset int64, algo BitrotAlgorithm, sum []byte, shardSize int64) io.ReaderAt {
+func newBitrotReader(disk StorageAPI, data []byte, bucket string, filePath string, tillOffset int64, algo BitrotAlgorithm, sum []byte, shardSize int64) io.ReaderAt {
 	if algo == HighwayHash256S {
-		return newStreamingBitrotReader(disk, bucket, filePath, tillOffset, algo, shardSize)
+		return newStreamingBitrotReader(disk, data, bucket, filePath, tillOffset, algo, shardSize)
 	}
 	return newWholeBitrotReader(disk, bucket, filePath, algo, tillOffset, sum)
 }
@@ -142,4 +143,55 @@ func bitrotShardFileSize(size int64, shardSize int64, algo BitrotAlgorithm) int6
 		return size
 	}
 	return ceilFrac(size, shardSize)*int64(algo.New().Size()) + size
+}
+
+// bitrotVerify a single stream of data.
+func bitrotVerify(r io.Reader, wantSize, partSize int64, algo BitrotAlgorithm, want []byte, shardSize int64) error {
+	if algo != HighwayHash256S {
+		h := algo.New()
+		if n, err := io.Copy(h, r); err != nil || n != wantSize {
+			// Premature failure in reading the object, file is corrupt.
+			return errFileCorrupt
+		}
+		if !bytes.Equal(h.Sum(nil), want) {
+			return errFileCorrupt
+		}
+		return nil
+	}
+
+	h := algo.New()
+	hashBuf := make([]byte, h.Size())
+	buf := make([]byte, shardSize)
+	left := wantSize
+
+	// Calculate the size of the bitrot file and compare
+	// it with the actual file size.
+	if left != bitrotShardFileSize(partSize, shardSize, algo) {
+		return errFileCorrupt
+	}
+
+	for left > 0 {
+		// Read expected hash...
+		h.Reset()
+		n, err := io.ReadFull(r, hashBuf)
+		if err != nil {
+			// Read's failed for object with right size, file is corrupt.
+			return err
+		}
+		// Subtract hash length..
+		left -= int64(n)
+		if left < shardSize {
+			shardSize = left
+		}
+		read, err := io.CopyBuffer(h, io.LimitReader(r, shardSize), buf)
+		if err != nil {
+			// Read's failed for object with right size, at different offsets.
+			return err
+		}
+		left -= read
+		if !bytes.Equal(h.Sum(nil), hashBuf) {
+			return errFileCorrupt
+		}
+	}
+	return nil
 }
